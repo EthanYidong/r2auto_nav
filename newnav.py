@@ -31,6 +31,9 @@ TURNING_RADIUS = 0.12
 
 OCCMAP_THRESHOLD = 50.0
 
+RAYCAST_ANGLES = 360
+
+
 def euler_from_quaternion(x, y, z, w):
     t0 = +2.0 * (w * x + y * z)
     t1 = +1.0 - 2.0 * (x * x + y * y)
@@ -83,6 +86,7 @@ class AutoNav(Node):
         self.occdata = np.array([])
         self.laser_range = np.array([])
         self.traversable_map = np.array([])
+        self.raycast = np.array([])
         self.margin_circle = []
 
     def turning_margin(self):
@@ -110,10 +114,16 @@ class AutoNav(Node):
         offset_y = base_link.transform.translation.y - map_position.y
 
         rotated_offset = map_rotation.inv().apply(np.array([offset_x, offset_y, 0]))
-        
-        self.traversable_map[int(rotated_offset[1] // self.map_info.resolution)][int(rotated_offset[0] // self.map_info.resolution)] = 2
+        map_x = int(rotated_offset[1] // self.map_info.resolution)
+        map_y = int(rotated_offset[0] // self.map_info.resolution)
+        self.traversable_map[map_x][map_y] = 2
         np.savetxt("occ.txt", self.occdata)
         np.savetxt("trav.txt", self.traversable_map)
+
+        print("start ray cast")
+        self.raycast_circle(map_x, map_y, 0)
+        np.savetxt("ray.txt", self.raycast)
+        print("ray cast")
 
     def scan_callback(self, msg):
         self.laser_range = np.array(msg.ranges)
@@ -133,6 +143,32 @@ class AutoNav(Node):
                 if self.occdata[x][y] >= OCCMAP_THRESHOLD:
                     self.traversable_map[x][y] = -1
                     self.fill_map(x, y, 0)
+
+    def raycast_circle(self, x, y, avoid):
+        self.raycast = np.full_like(self.occdata, -1, dtype=np.int32)
+        for ang in np.arange(0.0, 360.0, 360.0 / RAYCAST_ANGLES):
+            if ang == 90.0:
+                ang = 90.001
+
+            if ang == 270.0:
+                ang = 270.001
+
+            slope = math.tan(np.deg2rad(ang))
+            dir = -1 if (ang > 90.0 and ang < 270.0) else 1
+            dx = 1
+            while True:
+                cx = x + dx * dir
+                y_bound_min = int(math.floor(slope * (float(dx) - 0.5)))
+                y_bound_max = int(math.ceil(slope * (float(dx) + 0.5)))
+                for dy in range(min(y_bound_min, y_bound_max), max(y_bound_min, y_bound_max) + 1):
+                    cy = y + dy * dir
+                    if (not self.valid_point(cx, cy)) or self.traversable_map[cx][cy] <= avoid:
+                        break
+                    self.raycast[cx][cy] = 1
+                else:
+                    dx += 1
+                    continue
+                break
 
     def regenerate_margin_circle(self):
         self.margin_circle.clear()
