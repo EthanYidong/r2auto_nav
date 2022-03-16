@@ -19,10 +19,15 @@ from geometry_msgs.msg import Twist
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid
+
 import numpy as np
 import math
 import cmath
 import time
+
+from enum import Enum
+
+State = Enum('State', 'SEEK ALIGN TRAVEL_NEW_WALL FORWARD TURN_LEFT TURN_RIGHT')
 
 # constants
 rotatechange = 0.1
@@ -33,6 +38,24 @@ front_angle = 30
 front_angles = range(-front_angle,front_angle+1,1)
 scanfile = 'lidar.txt'
 mapfile = 'map.txt'
+
+seek_range = 5
+seek_threshold = 0.3
+
+left = 90
+left_angle = 15
+left_angles = range(left - left_angle, left + left_angle + 1)
+
+align = 90
+align_angle = 2
+
+scan = 0
+scan_angle = 5
+scan_angles = range(scan - scan_angle, scan + scan_angle + 1)
+
+fwd_v = 0.22
+turn_v = 1.0
+corner_thresh = 0.3
 
 # code from https://automaticaddison.com/how-to-convert-a-quaternion-into-euler-angles-in-python/
 def euler_from_quaternion(x, y, z, w):
@@ -97,6 +120,8 @@ class AutoNav(Node):
         self.scan_subscription  # prevent unused variable warning
         self.laser_range = np.array([])
 
+        self.state = State.SEEK
+        self.target = 0
 
     def odom_callback(self, msg):
         # self.get_logger().info('In odom_callback')
@@ -133,85 +158,6 @@ class AutoNav(Node):
         # replace 0's with nan
         self.laser_range[self.laser_range==0] = np.nan
 
-
-    # function to rotate the TurtleBot
-    def rotatebot(self, rot_angle):
-        # self.get_logger().info('In rotatebot')
-        # create Twist object
-        twist = Twist()
-        
-        # get current yaw angle
-        current_yaw = self.yaw
-        # log the info
-        self.get_logger().info('Current: %f' % math.degrees(current_yaw))
-        # we are going to use complex numbers to avoid problems when the angles go from
-        # 360 to 0, or from -180 to 180
-        c_yaw = complex(math.cos(current_yaw),math.sin(current_yaw))
-        # calculate desired yaw
-        target_yaw = current_yaw + math.radians(rot_angle)
-        # convert to complex notation
-        c_target_yaw = complex(math.cos(target_yaw),math.sin(target_yaw))
-        self.get_logger().info('Desired: %f' % math.degrees(cmath.phase(c_target_yaw)))
-        # divide the two complex numbers to get the change in direction
-        c_change = c_target_yaw / c_yaw
-        # get the sign of the imaginary component to figure out which way we have to turn
-        c_change_dir = np.sign(c_change.imag)
-        # set linear speed to zero so the TurtleBot rotates on the spot
-        twist.linear.x = 0.0
-        # set the direction to rotate
-        twist.angular.z = c_change_dir * rotatechange
-        # start rotation
-        self.publisher_.publish(twist)
-
-        # we will use the c_dir_diff variable to see if we can stop rotating
-        c_dir_diff = c_change_dir
-        # self.get_logger().info('c_change_dir: %f c_dir_diff: %f' % (c_change_dir, c_dir_diff))
-        # if the rotation direction was 1.0, then we will want to stop when the c_dir_diff
-        # becomes -1.0, and vice versa
-        while(c_change_dir * c_dir_diff > 0):
-            # allow the callback functions to run
-            rclpy.spin_once(self)
-            current_yaw = self.yaw
-            # convert the current yaw to complex form
-            c_yaw = complex(math.cos(current_yaw),math.sin(current_yaw))
-            # self.get_logger().info('Current Yaw: %f' % math.degrees(current_yaw))
-            # get difference in angle between current and target
-            c_change = c_target_yaw / c_yaw
-            # get the sign to see if we can stop
-            c_dir_diff = np.sign(c_change.imag)
-            # self.get_logger().info('c_change_dir: %f c_dir_diff: %f' % (c_change_dir, c_dir_diff))
-
-        self.get_logger().info('End Yaw: %f' % math.degrees(current_yaw))
-        # set the rotation speed to 0
-        twist.angular.z = 0.0
-        # stop the rotation
-        self.publisher_.publish(twist)
-
-
-    def pick_direction(self):
-        # self.get_logger().info('In pick_direction')
-        if self.laser_range.size != 0:
-            # use nanargmax as there are nan's in laser_range added to replace 0's
-            lr2i = np.nanargmax(self.laser_range)
-            self.get_logger().info('Picked direction: %d %f m' % (lr2i, self.laser_range[lr2i]))
-        else:
-            lr2i = 0
-            self.get_logger().info('No data!')
-
-        # rotate to that direction
-        self.rotatebot(float(lr2i))
-
-        # start moving
-        self.get_logger().info('Start moving')
-        twist = Twist()
-        twist.linear.x = speedchange
-        twist.angular.z = 0.0
-        # not sure if this is really necessary, but things seem to work more
-        # reliably with this
-        time.sleep(1)
-        self.publisher_.publish(twist)
-
-
     def stopbot(self):
         self.get_logger().info('In stopbot')
         # publish to cmd_vel to move TurtleBot
@@ -221,33 +167,53 @@ class AutoNav(Node):
         # time.sleep(1)
         self.publisher_.publish(twist)
 
+    def update_state(self):
+        closest_left = np.Inf
+        closest_scan = np.Inf
+        if len(self.laser_range) == 0:
+            return
+        for i in left_angles:
+            closest_left = min(closest_left, self.laser_range[i])
+        for i in scan_angles:
+            closest_scan = min(closest_scan, self.laser_range[i])
+        print("closest: %s" % closest_left)
+        print("front: %s" % closest_scan)
+        print("state: %s" % self.state)
+        if self.state == State.SEEK:
+            closest = np.nanargmin(self.laser_range)
+            if closest < seek_range or closest > 360 - seek_range:
+                if self.laser_range[closest] < 0.3:
+                    self.state = State.ALIGN
+        elif self.state == State.FORWARD:
+            if closest_left < corner_thresh and closest_scan < corner_thresh:
+                self.state = State.TURN_RIGHT
+            elif closest_left > closest_scan:
+                self.state = State.TURN_LEFT
+        elif self.state == State.TURN_LEFT:
+            if closest_left < closest_scan:
+                self.state = State.FORWARD
+        elif self.state == State.TURN_RIGHT:
+            if closest_left < closest_scan :
+                self.state = State.FORWARD
+
+    def execute_state(self):
+        twist = Twist()
+        if self.state == State.FORWARD: 
+            twist.linear.x = fwd_v
+            twist.angular.z = 0.0
+        elif self.state == State.TURN_LEFT:
+            twist.linear.x = 0.0
+            twist.angular.z = turn_v
+        elif self.state == State.TURN_RIGHT:
+            twist.linear.x = 0.0
+            twist.angular.z = -turn_v
+        self.publisher_.publish(twist)
 
     def mover(self):
         try:
-            # initialize variable to write elapsed time to file
-            # contourCheck = 1
-
-            # find direction with the largest distance from the Lidar,
-            # rotate to that direction, and start moving
-            self.pick_direction()
-
             while rclpy.ok():
-                if self.laser_range.size != 0:
-                    # check distances in front of TurtleBot and find values less
-                    # than stop_distance
-                    lri = (self.laser_range[front_angles]<float(stop_distance)).nonzero()
-                    # self.get_logger().info('Distances: %s' % str(lri))
-
-                    # if the list is not empty
-                    if(len(lri[0])>0):
-                        # stop moving
-                        self.stopbot()
-                        # find direction with the largest distance from the Lidar
-                        # rotate to that direction
-                        # start moving
-                        self.pick_direction()
-                    
-                # allow the callback functions to run
+                self.update_state()
+                self.execute_state()
                 rclpy.spin_once(self)
 
         except Exception as e:

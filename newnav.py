@@ -1,18 +1,5 @@
-# Copyright 2016 Open Source Robotics Foundation, Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from re import A
+from tkinter import E
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
@@ -29,13 +16,17 @@ from scipy.spatial.transform import Rotation
 from collections import deque
 
 TURNING_RADIUS = 0.12
+MOVEMENT_TOL = 0.01
+ANGLE_TOL = 5
 
 OCCMAP_THRESHOLD = 50.0
+UNSURE_THRESHOLD = 5.0
 
 RAYCAST_ANGLES = 360
 
-NBORS = [(-1, 0), (1, 0), (0, 1), (0, -1)]
+DEBUG = True
 
+NBORS = [(-1, 0), (1, 0), (0, 1), (0, -1)]
 
 def euler_from_quaternion(x, y, z, w):
     t0 = +2.0 * (w * x + y * z)
@@ -53,8 +44,15 @@ def euler_from_quaternion(x, y, z, w):
 
     return roll_x, pitch_y, yaw_z
 
-class AutoNav(Node):
 
+def angle_to(from_x, from_y, to_x, to_y):
+    return math.atan2(to_y - from_y, to_x - from_x)
+
+def dist_to(from_x, from_y, to_x, to_y):
+    return math.sqrt((to_y - from_y) ** 2 + (to_x - from_x) ** 2)
+
+
+class AutoNav(Node):
     def __init__(self):
         super().__init__('auto_nav')
         self.publisher_ = self.create_publisher(Twist,'cmd_vel',10)
@@ -85,68 +83,152 @@ class AutoNav(Node):
         self.yaw = 0
         self.x = 0
         self.y = 0
-        self.map_info = None
-        self.occdata = np.array([])
-        self.laser_range = np.array([])
-        self.traversable_map = np.array([])
-        self.raycast = np.array([])
-        self.bfs = np.array([])
-        self.reachable_bfs = np.array([])
+
         self.margin_circle = []
         self.path = []
+        self.cur_goal = None
 
-    def turning_margin(self):
-        return TURNING_RADIUS + self.map_info.resolution
+    def current_location(self):
+        try:
+            base_link = self.tfBuffer.lookup_transform('map', 'base_link', rclpy.time.Time(), rclpy.duration.Duration(seconds=1))
+        except Exception as e:
+            print("failed to get location")
+            if e is KeyboardInterrupt:
+                raise e
+            return None, None, None
 
-    def odom_callback(self, msg):
-        orientation_quat = msg.pose.pose.orientation
-        self.roll, self.pitch, self.yaw = euler_from_quaternion(orientation_quat.x, orientation_quat.y, orientation_quat.z, orientation_quat.w)
+        _roll, _pitch, yaw = euler_from_quaternion(base_link.transform.rotation.x, base_link.transform.rotation.y, base_link.transform.rotation.z, base_link.transform.rotation.w)
+        return base_link.transform.translation.x, base_link.transform.translation.y, yaw
 
-    def occ_callback(self, msg):
-        msgdata = np.array(msg.data)
-        oc2 = msgdata
-        self.occdata = np.int8(oc2.reshape(msg.info.height,msg.info.width))
-        self.map_info = msg.info
-        self.regenerate_map()
-
+    def to_map_coords(self, x, y):
         map_position = self.map_info.origin.position
         map_orientation = self.map_info.origin.orientation
 
         map_rotation = Rotation.from_quat([map_orientation.x, map_orientation.y, map_orientation.z, map_orientation.w])
-
-        try:
-            base_link = self.tfBuffer.lookup_transform('map', 'base_link', rclpy.time.Time())
-        except:
-            return
-
-        offset_x = base_link.transform.translation.x - map_position.x
-        offset_y = base_link.transform.translation.y - map_position.y
+        offset_x = x - map_position.x
+        offset_y = y - map_position.y
 
         rotated_offset = map_rotation.inv().apply(np.array([offset_x, offset_y, 0]))
         map_x = int(rotated_offset[1] // self.map_info.resolution)
         map_y = int(rotated_offset[0] // self.map_info.resolution)
 
-        # TODO: handle no gaps found (either map complete or we screwed up)
-        gap_x, gap_y = self.run_bfs(map_x, map_y)
-        self.run_reachable_bfs(map_x, map_y)
-        vis_x, vis_y = self.raycast_circle(gap_x, gap_y, -1)
-        print(vis_x, vis_y)
-        print(self.reachable_bfs[vis_x][vis_y])
+        return map_x, map_y
 
-        goal_x, goal_y = vis_x, vis_y
-        path = np.full_like(self.occdata, 0, np.int32)
-        while not (goal_x == map_x and goal_y == map_y):
-            self.path.append((goal_x, goal_y))
-            goal_x, goal_y = self.reachable_par[goal_x][goal_y]
-            path[goal_x][goal_y] = 1
+    def scannable_unknowns(self, start_x, start_y):
+        bfs = np.full_like(self.occdata, -1, dtype=np.int32)
+        scannable = []
+        q = deque()
+        q.append((start_x, start_y))
+        bfs[start_x][start_y] = 0
 
-        np.savetxt("occ.txt", self.occdata)
-        np.savetxt("ray.txt", self.raycast)
-        np.savetxt("trav.txt", self.traversable_map)
-        np.savetxt("bfs.txt", self.bfs)
-        np.savetxt("rbfs.txt", self.reachable_bfs)
-        np.savetxt("path.txt", path)
-        print("Regenerated pathing!")
+        while q:
+            px, py = q.popleft()
+            for dx, dy in NBORS:
+                cx = dx + px
+                cy = dy + py
+                if self.valid_point(cx, cy) and bfs[cx][cy] == -1:
+                    bfs[cx][cy] = bfs[px][py] + 1
+                    if self.occdata[cx][cy] < OCCMAP_THRESHOLD:
+                        if self.occdata[cx][cy] != -1:
+                            q.append((cx, cy))
+                        else:
+                            scannable.append((cx, cy))
+        return scannable
+    
+    def border(self, start_x, start_y):
+        bfs = np.full_like(self.occdata, -1, dtype=np.int32)
+        border = []
+        q = deque()
+        q.append((start_x, start_y))
+        bfs[start_x][start_y] = 0
+
+        while q:
+            px, py = q.popleft()
+            for dx, dy in NBORS:
+                cx = dx + px
+                cy = dy + py
+                if self.valid_point(cx, cy) and bfs[cx][cy] == -1:
+                    bfs[cx][cy] = bfs[px][py] + 1
+                    if self.occdata[cx][cy] < UNSURE_THRESHOLD and self.occdata[cx][cy] != -1:
+                        q.append((cx, cy))
+                    else:
+                        border.append((cx, cy))
+        return border, bfs
+
+    def raycast(self, x, y):
+        raycast = np.full_like(self.occdata, -1, dtype=np.int32)
+        for ang in np.arange(0.0, 360.0, 360.0 / RAYCAST_ANGLES):
+            dir = -1 if (ang > 90.0 and ang <= 270.0) else 1
+            dx = 1
+            if ang == 90.0 or ang == 270:
+                while True:
+                    cx = x
+                    cy = y + dx * dir
+                    if (not self.valid_point(cx, cy)) or self.occdata[cx][cy] > OCCMAP_THRESHOLD:
+                        break
+                    raycast[cx][cy] = 1
+                    dx += 1
+                continue
+
+            slope = math.tan(np.deg2rad(ang))
+            while True:
+                cx = x + dx * dir
+                y_bound_min = int(math.floor(slope * (float(dx) - 0.5)))
+                y_bound_max = int(math.ceil(slope * (float(dx) + 0.5)))
+                for dy in range(min(y_bound_min, y_bound_max), max(y_bound_min, y_bound_max) + 1):
+                    cy = y + dy * dir
+                    if (not self.valid_point(cx, cy)) or self.occdata[cx][cy] > OCCMAP_THRESHOLD:
+                        break
+                    raycast[cx][cy] = 1
+                else:
+                    dx += 1
+                    continue
+                break
+        return raycast
+
+    def valid_point(self, x, y):
+        return x >= 0 and x < np.size(self.occdata, 0) and y >= 0 and y < np.size(self.occdata, 1)
+
+    def turning_margin(self):
+        return TURNING_RADIUS + self.map_info.resolution
+
+    def odom_callback(self, msg):
+        position = msg.pose.pose.position
+        orientation_quat = msg.pose.pose.orientation
+        self.x, self.y = position.x, position.y
+        self.roll, self.pitch, self.yaw = euler_from_quaternion(orientation_quat.x, orientation_quat.y, orientation_quat.z, orientation_quat.w)
+
+    def occ_callback(self, msg):
+        msgdata = np.array(msg.data)
+        oc2 = msgdata
+        self.occdata = oc2.reshape(msg.info.height,msg.info.width)
+        self.map_info = msg.info
+
+        raw_x, raw_y, _ = self.current_location()
+        if raw_x is None:
+            return
+        map_x, map_y = self.to_map_coords(raw_x, raw_y)
+        print(map_x, map_y)
+        scannable = self.scannable_unknowns(map_x, map_y)
+        border, dist = self.border(map_x, map_y)
+
+        scan_x, scan_y = scannable[0]
+        print(scan_x, scan_y)
+        rays = self.raycast(scan_x, scan_y)
+        
+        if DEBUG:
+            scan_visualize = np.full_like(self.occdata, 0, dtype=np.int32)
+            for s_x, s_y in scannable:
+                scan_visualize[s_x][s_y] = 1
+            border_visualize = np.full_like(self.occdata, 0, dtype=np.int32)
+            for s_x, s_y in border:
+                border_visualize[s_x][s_y] = 1
+            np.savetxt("occ.txt", self.occdata)
+            np.savetxt("scan.txt", scan_visualize)
+            np.savetxt("border.txt", border_visualize)
+            np.savetxt("dist.txt", dist)
+            np.savetxt("rays.txt", rays)
+            print("debug saved")
 
     def scan_callback(self, msg):
         self.laser_range = np.array(msg.ranges)
@@ -158,124 +240,9 @@ class AutoNav(Node):
         twist.angular.z = 0.0
         self.publisher_.publish(twist)
 
-    def regenerate_map(self):
-        self.regenerate_margin_circle()
-        self.traversable_map = np.full_like(self.occdata, 1, dtype=np.int32)
-        for x in range(np.size(self.occdata, 0)):
-            for y in range(np.size(self.occdata, 1)):
-                if self.occdata[x][y] >= OCCMAP_THRESHOLD:
-                    self.traversable_map[x][y] = -1
-                    self.fill_map(x, y, 0)
-
-    def raycast_circle(self, x, y, avoid):
-        closest = None
-        ret = None
-        self.raycast = np.full_like(self.occdata, -1, dtype=np.int32)
-        for ang in np.arange(0.0, 360.0, 360.0 / RAYCAST_ANGLES):
-            dir = -1 if (ang > 90.0 and ang <= 270.0) else 1
-            dx = 1
-
-            if ang == 90.0 or ang == 270:
-                while True:
-                    cx = x
-                    cy = y + dx * dir
-                    if (not self.valid_point(cx, cy)) or self.traversable_map[cx][cy] <= avoid:
-                        break
-                    self.raycast[cx][cy] = 1
-                    if self.reachable_bfs[cx][cy] != -1 and (closest is None or closest > self.reachable_bfs[cx][cy]):
-                        closest = self.reachable_bfs[cx][cy]
-                        ret = (cx, cy)
-                    dx += 1
-                continue
-
-            slope = math.tan(np.deg2rad(ang))
-            while True:
-                cx = x + dx * dir
-                y_bound_min = int(math.floor(slope * (float(dx) - 0.5)))
-                y_bound_max = int(math.ceil(slope * (float(dx) + 0.5)))
-                for dy in range(min(y_bound_min, y_bound_max), max(y_bound_min, y_bound_max) + 1):
-                    cy = y + dy * dir
-                    if (not self.valid_point(cx, cy)) or self.traversable_map[cx][cy] <= avoid:
-                        break
-                    self.raycast[cx][cy] = 1
-                    if self.reachable_bfs[cx][cy] != -1 and (closest is None or closest > self.reachable_bfs[cx][cy]):
-                        closest = self.reachable_bfs[cx][cy]
-                        ret = (cx, cy)
-                else:
-                    dx += 1
-                    continue
-                break
-        return ret
-    
-    def run_bfs(self, x, y):
-        self.bfs = np.full_like(self.occdata, -1, dtype=np.int32)
-        q = deque()
-        q.append((x, y))
-        self.bfs[x][y] = 0
-
-        ret = None
-        while q:
-            px, py = q.popleft()
-            for dx, dy in NBORS:
-                cx = dx + px
-                cy = dy + py
-                if self.valid_point(cx, cy):
-                    if self.traversable_map[cx][cy] > -1 and self.bfs[cx][cy] == -1:
-                        self.bfs[cx][cy] = self.bfs[px][py] + 1
-                        q.append((cx, cy))
-                    if self.occdata[cx][cy] == -1:
-                        if ret is None:
-                            ret = (cx, cy)
-        return ret
-
-    def run_reachable_bfs(self, x, y):
-        self.reachable_bfs = np.full_like(self.occdata, -1, dtype=np.int32)
-        self.reachable_par = np.full_like(self.occdata, -1, dtype=(np.int32, 2))
-
-        q = deque()
-        q.append((x, y))
-        self.reachable_bfs[x][y] = 0
-
-        while q:
-            px, py = q.popleft()
-            for dx, dy in NBORS:
-                cx = dx + px
-                cy = dy + py
-                if self.valid_point(cx, cy):
-                    if self.traversable_map[cx][cy] > 0 and self.reachable_bfs[cx][cy] == -1:
-                        self.reachable_bfs[cx][cy] = self.reachable_bfs[px][py] + 1
-                        self.reachable_par[cx][cy] = [px, py]
-                        q.append((cx, cy))
-
-
-    def regenerate_margin_circle(self):
-        self.margin_circle.clear()
-        margin = self.turning_margin()
-        x_range = math.ceil(margin / self.map_info.resolution)
-        for dx in range (0, x_range + 1):
-            y_min = math.ceil(math.sqrt((x_range ** 2) - (dx ** 2)))
-            y_max = max(y_min, math.ceil(math.sqrt((x_range ** 2) - ((dx - 1) ** 2))) - 1)
-            for dy in range(y_min, y_max + 1):
-                self.margin_circle.append((dx, -dy))
-                self.margin_circle.append((dx, dy))
-                self.margin_circle.append((-dx, -dy))
-                self.margin_circle.append((-dx, dy))
-
-    def valid_point(self, x, y):
-        return x >= 0 and x < np.size(self.occdata, 0) and y >= 0 and y < np.size(self.occdata, 1)
-
-    def fill_map(self, x, y, val):
-        for dx, dy in self.margin_circle:
-            cx = x + dx
-            cy = y + dy
-            if self.valid_point(cx, cy):
-                self.traversable_map[cx][cy] = min(self.traversable_map[cx][cy], val)
-
     def mover(self):
         try:
             while rclpy.ok():
-                if self.map_info is not None:
-                    pass
                 rclpy.spin_once(self)
         except Exception as e:
             print(e)

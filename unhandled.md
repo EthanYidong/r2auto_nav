@@ -1,0 +1,2 @@
+- [ ] reaching a position that is not traversable
+- [ ] not finding a suitable gap 
