@@ -28,10 +28,11 @@ TURNING_RADIUS = 0.12
 PADDING = 0.05
 MARGIN = TURNING_RADIUS + PADDING * 2
 
-ROBOT_LEFT = -0.10
-ROBOT_RIGHT = 0.10
+ROBOT_LEFT = 0.10
+ROBOT_RIGHT = -0.10
 ROBOT_FRONT = 0.15
 ROBOT_BACK = -0.08
+ROBOT_LEN = ROBOT_FRONT - ROBOT_BACK
 
 # How close to target before we taper speed
 TURN_TAPER_THRESHOLD = 20.0
@@ -51,7 +52,7 @@ DEBUG = True
 
 NBORS = [(-1, 0), (1, 0), (0, 1), (0, -1)]
 
-State = Enum('State', 'BEGIN SEEK ALIGN TRAVEL_NEW_WALL FORWARD TURN_LEFT TURN_RIGHT')
+State = Enum('State', 'BEGIN SEEK TURN_LEFT TURN_RIGHT LOCKED_FORWARD FORWARD')
 
 def euler_from_quaternion(x, y, z, w):
     t0 = +2.0 * (w * x + y * z)
@@ -165,11 +166,13 @@ class AutoNav(Node):
             pose=self.odom.pose.pose,
         )
 
+
+        last_error = None
         for _tries in range(10):
             try:
                 base_link = self.tfBuffer.transform(odom_pose, 'map')
             except Exception as e:
-                print("failed to get location:", e)
+                last_error = e
                 if odom_pose.header.stamp.nanosec >= 100000000:
                     odom_pose.header.stamp.nanosec -= 100000000
                 else:
@@ -180,10 +183,23 @@ class AutoNav(Node):
             else:
                 break
         else:
+            print("failed to get location:", last_error)
             return None, None, None
         _roll, _pitch, yaw = euler_from_quaternion(base_link.pose.orientation.x, base_link.pose.orientation.y, base_link.pose.orientation.z, base_link.pose.orientation.w)
         return base_link.pose.position.x, base_link.pose.position.y, np.rad2deg(yaw)
 
+    def blocked(self):
+        for x, y in self.laser_surroundings:
+            if y >= ROBOT_RIGHT and y <= ROBOT_LEFT and x >= ROBOT_FRONT and x <= ROBOT_FRONT + PADDING * 2:
+                return True
+        return False
+
+    def empty_right(self):
+        for x, y in self.laser_surroundings:
+            if x <= ROBOT_FRONT + PADDING and x >= ROBOT_BACK - PADDING and y <= ROBOT_RIGHT and y >= ROBOT_RIGHT - PADDING * 2:
+                return False
+        return True
+    
     def to_map_coords(self, x, y):
         map_position = self.map_info.origin.position
         map_orientation = self.map_info.origin.orientation
@@ -221,22 +237,21 @@ class AutoNav(Node):
 
         self.update_state_scan()
 
-
     def timer_callback(self):
         self.execute_state()
 
-    def change_state(self, new_state):
+    def change_state(self, new_state, **kwargs):
         x, y, yaw = self.current_location()
         self.state = new_state
+        self.state_data = {}
 
         if self.state == State.SEEK:
             closest_idx = np.nanargmin(self.laser_range)
             self.state_data = { "target_angle": (yaw + closest_idx) % 360 }
-        elif self.state == State.ALIGN:
-            closest_idx = np.nanargmin(self.laser_range)
-            self.state_data = { "target_angle": (yaw + closest_idx + 90) % 360 }
-        elif self.state == State.FORWARD:
-            pass
+        elif self.state == State.TURN_RIGHT:
+            self.state_data = { "target_angle": (yaw + 270) % 360 }
+        elif self.state == State.LOCKED_FORWARD:
+            self.state_data = { "dist": kwargs.get("dist"), "start": (x, y) }
         print("state", self.state, self.state_data)
 
     def update_state_scan(self):
@@ -246,11 +261,25 @@ class AutoNav(Node):
         if self.state == State.BEGIN:
             self.change_state(State.SEEK)
         elif self.state == State.SEEK:
-            if(self.laser_range[0] < MARGIN):
-                self.change_state(State.ALIGN)
-        elif self.state == State.ALIGN:
-            diff = angle_diff(yaw, self.state_data["target_angle"])
-            if achieved_angle(diff):
+            _, achieved = turn_towards(yaw, self.state_data["target_angle"])
+            if achieved:
+                self.change_state(State.LOCKED_FORWARD)
+        elif self.state == State.TURN_LEFT:
+            if not self.blocked():
+                self.change_state(State.FORWARD)
+        elif self.state == State.TURN_RIGHT:
+            _, achieved = turn_towards(yaw, self.state_data["target_angle"])
+            if achieved:
+                self.change_state(State.LOCKED_FORWARD, dist=ROBOT_LEN)
+        elif self.state == State.FORWARD:
+            if self.empty_right():
+                self.change_state(State.TURN_RIGHT)
+            elif self.blocked():
+                self.change_state(State.TURN_LEFT)
+        elif self.state == State.LOCKED_FORWARD:
+            if self.blocked():
+                self.change_state(State.TURN_LEFT)
+            elif self.state_data["dist"] is not None and dist_to(*self.state_data["start"], x, y) >= self.state_data["dist"]:
                 self.change_state(State.FORWARD)
             
     def execute_state(self):
@@ -259,12 +288,14 @@ class AutoNav(Node):
         twist.angular.z = 0.0
         twist.linear.x = 0.0
         if self.state == State.SEEK:
-            twist, achieved = turn_towards(yaw, self.state_data["target_angle"])
-            if achieved:
-                twist.linear.x = taper_move(self.laser_range[0])
-        elif self.state == State.ALIGN:
+            twist, _ = turn_towards(yaw, self.state_data["target_angle"])
+        elif self.state == State.TURN_LEFT:
+            twist.angular.z = TURNING_VEL
+        elif self.state == State.TURN_RIGHT:
             twist, _ = turn_towards(yaw, self.state_data["target_angle"])
         elif self.state == State.FORWARD:
+            twist.linear.x = taper_move(self.laser_range[0])
+        elif self.state == State.LOCKED_FORWARD:
             twist.linear.x = taper_move(self.laser_range[0])
 
         if self.current_twist != twist:
