@@ -9,6 +9,7 @@ from geometry_msgs.msg import Twist, PoseStamped
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid
+from std_msgs.msg import Float32MultiArray
 import numpy as np
 import math
 import cmath
@@ -44,6 +45,7 @@ MOVING_THRESHOLD = MARGIN
 
 # How fast to go
 TURNING_VEL = 1.82
+SLOW_TURNING_VEL = 0.5
 MIN_TURNING_VEL = 0.2
 FORWARD_VEL = 0.21
 MIN_FORWARD_VEL = 0.1
@@ -141,6 +143,12 @@ class AutoNav(Node):
             self.scan_callback,
             qos_profile_sensor_data)
 
+        self.therm_subscription = self.create_subscription(
+            Float32MultiArray,
+            'thermal',
+            self.thermal_callback,
+            qos_profile_sensor_data)
+
         self._timer = self.create_timer(UPDATE_PERIOD, self.timer_callback)
 
         self.tfBuffer = tf2_ros.Buffer(rclpy.duration.Duration(seconds=60))
@@ -154,6 +162,7 @@ class AutoNav(Node):
         self.odom = None
         self.base_link = None
         self.current_twist = None
+        self.thermal = None
 
         self.state = State.BEGIN
         self.state_data = {}
@@ -237,11 +246,19 @@ class AutoNav(Node):
 
         self.update_state_scan()
 
+    def thermal_callback(self, msg):
+        msgdata = np.array(msg.data)
+        self.thermal = msgdata.reshape([24,32])
+        print("heat:", np.max(self.thermal))
+
     def timer_callback(self):
         self.execute_state()
 
     def change_state(self, new_state, **kwargs):
         x, y, yaw = self.current_location()
+        if x is None:
+            self.stopbot()
+            return
         self.state = new_state
         self.state_data = {}
 
@@ -257,6 +274,7 @@ class AutoNav(Node):
     def update_state_scan(self):
         x, y, yaw = self.current_location()
         if x is None:
+            self.stopbot()
             return
         if self.state == State.BEGIN:
             self.change_state(State.SEEK)
@@ -284,13 +302,16 @@ class AutoNav(Node):
             
     def execute_state(self):
         x, y, yaw = self.current_location()
+        if x is None:
+            self.stopbot()
+            return
         twist = Twist()
         twist.angular.z = 0.0
         twist.linear.x = 0.0
         if self.state == State.SEEK:
             twist, _ = turn_towards(yaw, self.state_data["target_angle"])
         elif self.state == State.TURN_LEFT:
-            twist.angular.z = TURNING_VEL
+            twist.angular.z = SLOW_TURNING_VEL
         elif self.state == State.TURN_RIGHT:
             twist, _ = turn_towards(yaw, self.state_data["target_angle"])
         elif self.state == State.FORWARD:

@@ -28,7 +28,8 @@ setup(
             'r2auto_nav = auto_nav.r2auto_nav:main',
             'newnav = auto_nav.newnav:main',
             'wallfollow = auto_nav.wallfollow:main',
-            'thermal = auto_nav.client.thermal:main',
+            'thermal = auto_nav.thermal:main',
+            'nfc = auto_nav.nfc:main',
         ],
     },
 )

@@ -1,2 +1,1 @@
-- [ ] reaching a position that is not traversable
-- [ ] not finding a suitable gap 
+- [ ] use easing for turn left and turn right states 
