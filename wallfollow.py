@@ -9,7 +9,7 @@ from geometry_msgs.msg import Twist, PoseStamped
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, Empty
 import numpy as np
 import math
 import cmath
@@ -30,7 +30,7 @@ PADDING = 0.05
 MARGIN = TURNING_RADIUS + PADDING * 2
 
 ROBOT_LEFT = 0.10
-ROBOT_RIGHT = -0.10
+ROBOT_RIGHT = -0.15
 ROBOT_FRONT = 0.15
 ROBOT_BACK = -0.08
 ROBOT_LEN = ROBOT_FRONT - ROBOT_BACK
@@ -54,7 +54,7 @@ DEBUG = True
 
 NBORS = [(-1, 0), (1, 0), (0, 1), (0, -1)]
 
-State = Enum('State', 'BEGIN SEEK TURN_LEFT TURN_RIGHT LOCKED_FORWARD FORWARD')
+State = Enum('State', 'BEGIN SEEK TURN_LEFT TURN_RIGHT LOCKED_FORWARD FORWARD LOADING')
 
 def euler_from_quaternion(x, y, z, w):
     t0 = +2.0 * (w * x + y * z)
@@ -143,10 +143,16 @@ class AutoNav(Node):
             self.scan_callback,
             qos_profile_sensor_data)
 
-        self.therm_subscription = self.create_subscription(
+        self._therm_subscription = self.create_subscription(
             Float32MultiArray,
             'thermal',
             self.thermal_callback,
+            qos_profile_sensor_data)
+        
+        self.nfc_subscription = self.create_subscription(
+            Empty,
+            'nfc',
+            self.nfc_callback,
             qos_profile_sensor_data)
 
         self._timer = self.create_timer(UPDATE_PERIOD, self.timer_callback)
@@ -163,6 +169,7 @@ class AutoNav(Node):
         self.base_link = None
         self.current_twist = None
         self.thermal = None
+        self.seen_nfc = False
 
         self.state = State.BEGIN
         self.state_data = {}
@@ -174,7 +181,6 @@ class AutoNav(Node):
             header=self.odom.header,
             pose=self.odom.pose.pose,
         )
-
 
         last_error = None
         for _tries in range(10):
@@ -251,6 +257,9 @@ class AutoNav(Node):
         self.thermal = msgdata.reshape([24,32])
         print("heat:", np.max(self.thermal))
 
+    def nfc_callback(self, _msg):
+        self.update_state_nfc()
+
     def timer_callback(self):
         self.execute_state()
 
@@ -259,17 +268,34 @@ class AutoNav(Node):
         if x is None:
             self.stopbot()
             return
-        self.state = new_state
-        self.state_data = {}
 
-        if self.state == State.SEEK:
+        if new_state == State.SEEK:
             closest_idx = np.nanargmin(self.laser_range)
             self.state_data = { "target_angle": (yaw + closest_idx) % 360 }
-        elif self.state == State.TURN_RIGHT:
+        elif new_state == State.TURN_RIGHT:
             self.state_data = { "target_angle": (yaw + 270) % 360 }
-        elif self.state == State.LOCKED_FORWARD:
+        elif new_state == State.LOCKED_FORWARD:
             self.state_data = { "dist": kwargs.get("dist"), "start": (x, y) }
+        elif new_state == State.LOADING:
+            self.state_data = {
+                "previous_state": self.state,
+                "previous_state_data": self.state_data,
+            }
+        else:
+            self.state_data = {}
+        self.state = new_state
         print("state", self.state, self.state_data)
+
+    def update_state_nfc(self):
+        if not self.seen_nfc:
+            self.seen_nfc = True
+            self.change_state(State.LOADING)
+            self.stopbot()
+
+    def update_state_button(self):
+        print("Button pressed, resuming.")
+        self.state = self.state_data["previous_state"]
+        self.state_data = self.state_data["previous_state_data"]
 
     def update_state_scan(self):
         x, y, yaw = self.current_location()

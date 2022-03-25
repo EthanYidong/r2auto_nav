@@ -12,7 +12,7 @@ from std_msgs.msg import Empty
 
 PERIOD = 0.1
 
-class Thermal(Node):
+class NFC(Node):
     def __init__(self):
         super().__init__('nfc_pub')
         self.publisher_ = self.create_publisher(Empty, 'nfc', 10)
@@ -29,6 +29,7 @@ class Thermal(Node):
         try:
             uid = self.pn532.read_passive_target(timeout=0.1)
             if uid is not None:
+                print("NFC Detected")
                 self.publisher_.publish(Empty())
         except Exception as e:
             if e is not KeyboardInterrupt:
@@ -36,9 +37,9 @@ class Thermal(Node):
                 
 def main(args=None):
 	rclpy.init(args=args)
-	thermal_pub = Thermal()
-	rclpy.spin(thermal_pub)
-	thermal_pub.destroy_node()
+	nfc_pub = NFC()
+	rclpy.spin(nfc_pub)
+	nfc_pub.destroy_node()
 	rclpy.shutdown()
 
 if __name__ == '__main__':
