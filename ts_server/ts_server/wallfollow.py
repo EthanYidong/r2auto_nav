@@ -3,6 +3,7 @@ from enum import Enum
 import math
 import cmath
 import time
+import traceback
 
 import rclpy
 from rclpy.node import Node
@@ -42,7 +43,7 @@ THERMAL_FOV = 110.0
 THERMAL_WIDTH = 32
 THERMAL_H_RANGE = range(8, 16)
 
-TEMP_THRESHOLD = 28
+TEMP_THRESHOLD = 35
 TEMP_PERCENTILE = 75
 
 # How close to target before we taper speed
@@ -132,7 +133,7 @@ def generate_surroundings(laser_range):
 
 def mlx_index(angle):
     if angle >= -THERMAL_ANGLE_BOUNDS and angle <= THERMAL_ANGLE_BOUNDS:
-        index = round((angle + THERMAL_FOV / 2) / THERMAL_FOV * THERMAL_WIDTH)
+        index = int(round((angle + THERMAL_FOV / 2) / THERMAL_FOV * THERMAL_WIDTH))
         if index >= 0 and index < THERMAL_WIDTH:
             return index
     return None
@@ -405,7 +406,7 @@ class AutoNav(Node):
             while rclpy.ok():              
                 rclpy.spin(self)
         except Exception as e:
-            print(e)
+            traceback.print_exc()
         finally:
             self.stopbot()
 

@@ -48,7 +48,7 @@ cd ~/turtlebot_ws/src
 git clone https://github.com/EthanYidong/r2auto_nav
 
 cd ~/turtlebot_ws
-colcon build --packages-select ts_client ts_server
+colcon build --packages-select ts_client
 source ~/.bashrc
 
 echo "Done setting up, please reboot."
