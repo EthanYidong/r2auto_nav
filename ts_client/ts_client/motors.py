@@ -24,7 +24,7 @@ class Motors(Node):
 
         self.flywheels = GPIO.PWM(18, 1000)
         self.servo = GPIO.PWM(22, 50)
-        self.servo.ChangeDutyCycle(7.5)
+        self.servo.start(7.5)
         self.get_logger().info("Motor runner started")
 
     def motor_callback(self, msg):
