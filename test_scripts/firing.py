@@ -10,7 +10,7 @@ servo = G.PWM(22, 50)
 servo.start(7.5)
 for i in range(51):
 	pwm.start(i)
-	time.sleep(0.1)
+	time.sleep(0.2)
 
 print("spun up!")
 

@@ -32,7 +32,7 @@ class Motors(Node):
         if(cmd == 0):
             self.flywheels.start(0)
         elif(cmd == 1):
-            for i in range(101):
+            for i in range(51):
                 self.flywheels.start(i)
                 time.sleep(0.2)
         elif(cmd == 2):
