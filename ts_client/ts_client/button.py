@@ -1,7 +1,4 @@
-import sys
-
 import RPi.GPIO as GPIO
-import time
 import rclpy
 from rclpy.node import Node
 
@@ -19,12 +16,12 @@ class Button(Node):
         GPIO.setup(15, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         self.pressed = False
 
-        print("Button publisher started")
+        self.get_logger().info("Button publisher started")
 
     def timer_callback(self):
         try:
             if not self.pressed and not GPIO.input(15):
-                print("Button pressed")
+                self.get_logger().info("Button pressed")
                 self.publisher_.publish(Empty())
                 self.pressed = True
             if GPIO.input(15):

@@ -1,6 +1,6 @@
 from setuptools import setup
 
-package_name = 'auto_nav'
+package_name = 'ts_server'
 
 setup(
     name=package_name,
@@ -13,16 +13,14 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='nus',
-    maintainer_email='nus@todo.todo',
+    maintainer='ethan',
+    maintainer_email='ethan@todo.todo',
     description='TODO: Package description',
     license='TODO: License declaration',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'wallfollow = auto_nav.wallfollow:main',
-            'thermal = auto_nav.thermal:main',
-            'nfc = auto_nav.nfc:main',
+            'wallfollow = ts_server.wallfollow:main'
         ],
     },
 )

@@ -1,10 +1,8 @@
-import sys
-
-sys.path.insert(0, "/home/ubuntu/labcode/EG2310_NFC")
-
-from pn532 import *
-import RPi.GPIO as GPIO
 import time
+
+from .pn532 import *
+import RPi.GPIO as GPIO
+
 import rclpy
 from rclpy.node import Node
 
@@ -20,7 +18,7 @@ class NFC(Node):
 
         self.pn532 = PN532_I2C(debug=False, reset=20, req=16)
         ic, ver, rev, support = self.pn532.get_firmware_version()
-        print('Found PN532 with firmware version: {0}.{1}'.format(ver, rev))
+        self.get_logger().info('Found PN532 with firmware version: {0}.{1}'.format(ver, rev))
 
         # Configure PN532 to communicate with MiFare cards
         self.pn532.SAM_configuration()
@@ -29,7 +27,7 @@ class NFC(Node):
         try:
             uid = self.pn532.read_passive_target(timeout=0.1)
             if uid is not None:
-                print("NFC Detected")
+                self.get_logger().info("NFC Detected")
                 self.publisher_.publish(Empty())
         except Exception as e:
             if e is not KeyboardInterrupt:

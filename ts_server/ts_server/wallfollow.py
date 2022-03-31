@@ -1,25 +1,24 @@
-from http.client import MOVED_PERMANENTLY
-from re import A
-import re
-from tkinter import E
+from collections import deque
+from enum import Enum
+import math
+import cmath
+import time
+
 import rclpy
 from rclpy.node import Node
+
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist, PoseStamped
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid
 from std_msgs.msg import Float32MultiArray, Empty
+
 import numpy as np
-import math
-import cmath
-import time
 import tf2_ros
 from scipy.spatial.transform import Rotation
-from collections import deque
-from .conv import *
 
-from enum import Enum
+from .conv import *
 
 # How often to update and re-execute state
 UPDATE_PERIOD = 0.1
@@ -29,11 +28,22 @@ TURNING_RADIUS = 0.12
 PADDING = 0.05
 MARGIN = TURNING_RADIUS + PADDING * 2
 
-ROBOT_LEFT = 0.10
+ROBOT_LEFT = 0.15
 ROBOT_RIGHT = -0.15
-ROBOT_FRONT = 0.15
+ROBOT_FRONT = 0.12
 ROBOT_BACK = -0.08
 ROBOT_LEN = ROBOT_FRONT - ROBOT_BACK
+
+THERMAL_X = 0.09
+THERMAL_Y = -0.04
+
+THERMAL_ANGLE_BOUNDS = 55.0
+THERMAL_FOV = 110.0
+THERMAL_WIDTH = 32
+THERMAL_H_RANGE = range(8, 16)
+
+TEMP_THRESHOLD = 28
+TEMP_PERCENTILE = 75
 
 # How close to target before we taper speed
 TURN_TAPER_THRESHOLD = 20.0
@@ -120,6 +130,13 @@ def generate_surroundings(laser_range):
             laser_surroundings.append(p_rot)
     return laser_surroundings
 
+def mlx_index(angle):
+    if angle >= -THERMAL_ANGLE_BOUNDS and angle <= THERMAL_ANGLE_BOUNDS:
+        index = round((angle + THERMAL_FOV / 2) / THERMAL_FOV * THERMAL_WIDTH)
+        if index >= 0 and index < THERMAL_WIDTH:
+            return index
+    return None
+
 class AutoNav(Node):
     def __init__(self):
         super().__init__('auto_nav')
@@ -149,10 +166,16 @@ class AutoNav(Node):
             self.thermal_callback,
             qos_profile_sensor_data)
         
-        self.nfc_subscription = self.create_subscription(
+        self._nfc_subscription = self.create_subscription(
             Empty,
             'nfc',
             self.nfc_callback,
+            qos_profile_sensor_data)
+        
+        self._button_subscription = self.create_subscription(
+            Empty,
+            'button',
+            self.button_callback,
             qos_profile_sensor_data)
 
         self._timer = self.create_timer(UPDATE_PERIOD, self.timer_callback)
@@ -162,6 +185,7 @@ class AutoNav(Node):
 
         self.laser_range = None
         self.laser_surroundings = None
+        self.thermal_surroundings = None
         self.scan_data = None
         self.occdata = None
         self.map_info = None
@@ -255,10 +279,36 @@ class AutoNav(Node):
     def thermal_callback(self, msg):
         msgdata = np.array(msg.data)
         self.thermal = msgdata.reshape([24,32])
-        print("heat:", np.max(self.thermal))
+        self.thermal_surroundings = []
+        if self.laser_surroundings is not None:
+            for x, y in self.laser_surroundings:
+                dx = x - THERMAL_X
+                dy = y - THERMAL_Y
+
+                # Swap x and y because we are measuring angle with respect to the y axis
+                ang = np.rad2deg(math.atan2(dy, dx))
+                index = mlx_index(ang)
+                if index is None:
+                    continue
+                temps = []
+                for h in THERMAL_H_RANGE:
+                    temps.append(self.thermal[h][index])
+                temp_per = np.percentile(temps, TEMP_PERCENTILE)
+                if temp_per >= TEMP_THRESHOLD:
+                    self.thermal_surroundings.append((x, y, temp_per))
+        if len(self.thermal_surroundings) != 0:
+            sx = 0.0
+            sy = 0.0
+            for xt, yt, temp in self.thermal_surroundings:
+                sx += xt
+                sy += yt
+            print(sx / len(self.thermal_surroundings), sy / len(self.thermal_surroundings))
 
     def nfc_callback(self, _msg):
         self.update_state_nfc()
+
+    def button_callback(self, _msg):
+        self.update_state_button()
 
     def timer_callback(self):
         self.execute_state()
@@ -296,6 +346,7 @@ class AutoNav(Node):
         print("Button pressed, resuming.")
         self.state = self.state_data["previous_state"]
         self.state_data = self.state_data["previous_state_data"]
+        self.loaded = True
 
     def update_state_scan(self):
         x, y, yaw = self.current_location()
