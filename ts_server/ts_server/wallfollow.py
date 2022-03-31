@@ -406,7 +406,7 @@ class AutoNav(Node):
         print("Found heat at:", ax, ay)
 
         if self.loaded != 0 and self.state != State.SEEK_TARGET:
-            self.change_state(State.SEEK_TARGET, angle = np.rad2deg(math.atan2(ax, ay)))
+            self.change_state(State.SEEK_TARGET, angle = np.rad2deg(math.atan2(ay, ax)))
 
             
     def execute_state(self):
@@ -439,6 +439,8 @@ class AutoNav(Node):
             while self.loaded > 0:
                 self.motor_publisher_.publish(Int32(data=2))
                 time.sleep(1)
+                self.loaded -= 1
+            self.motor_publisher_.publish(Int32(data=0))
             self.change_state(State.DONE)
 
         if self.current_twist != twist:
