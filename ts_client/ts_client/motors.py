@@ -36,7 +36,7 @@ class Motors(Node):
                 self.flywheels.start(i)
                 time.sleep(0.02)
         elif(cmd == 2):
-            self.servo.ChangeDutyCycle(2.5)
+            self.servo.ChangeDutyCycle(10.5)
             time.sleep(0.5)
             self.servo.ChangeDutyCycle(7.5)
         pass
