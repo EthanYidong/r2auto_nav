@@ -12,6 +12,7 @@ for i in range(101):
 	pwm.start(i)
 	time.sleep(0.1)
 
+print("spun up!")
 
 try:
     while True:
@@ -20,5 +21,6 @@ try:
         time.sleep(0.5)
         servo.ChangeDutyCycle(7.5)
 except:
-	servo.ChangeDutyCycle(10.5)
+	servo.ChangeDutyCycle(7.5)
 	pwm.stop()
+    time.sleep(0.5)
