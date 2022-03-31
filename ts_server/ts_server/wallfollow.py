@@ -13,7 +13,7 @@ from geometry_msgs.msg import Twist, PoseStamped
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid
-from std_msgs.msg import Float32MultiArray, Empty
+from std_msgs.msg import Float32MultiArray, Int32, Empty
 
 import numpy as np
 import tf2_ros
@@ -46,6 +46,9 @@ THERMAL_H_RANGE = range(8, 16)
 TEMP_THRESHOLD = 35
 TEMP_PERCENTILE = 75
 
+# How many balls we load
+BALLS_LOADED = 5
+
 # How close to target before we taper speed
 TURN_TAPER_THRESHOLD = 20.0
 MOVE_TAPER_THRESHOLD = 0.5
@@ -65,7 +68,7 @@ DEBUG = True
 
 NBORS = [(-1, 0), (1, 0), (0, 1), (0, -1)]
 
-State = Enum('State', 'BEGIN SEEK TURN_LEFT TURN_RIGHT LOCKED_FORWARD FORWARD LOADING')
+State = Enum('State', 'BEGIN SEEK TURN_LEFT TURN_RIGHT LOCKED_FORWARD FORWARD LOADING SEEK_TARGET MOVE_TARGET FIRING DONE')
 
 def euler_from_quaternion(x, y, z, w):
     t0 = +2.0 * (w * x + y * z)
@@ -142,6 +145,8 @@ class AutoNav(Node):
     def __init__(self):
         super().__init__('auto_nav')
         self.publisher_ = self.create_publisher(Twist,'cmd_vel',10)
+        self.motor_publisher_ = self.create_publisher(Int32,'motor',10)
+        
 
         self._odom_subscription = self.create_subscription(
             Odometry,
@@ -195,6 +200,8 @@ class AutoNav(Node):
         self.current_twist = None
         self.thermal = None
         self.seen_nfc = False
+        # TODO: change to 0 after debugging
+        self.loaded = 1
 
         self.state = State.BEGIN
         self.state_data = {}
@@ -297,13 +304,7 @@ class AutoNav(Node):
                 temp_per = np.percentile(temps, TEMP_PERCENTILE)
                 if temp_per >= TEMP_THRESHOLD:
                     self.thermal_surroundings.append((x, y, temp_per))
-        if len(self.thermal_surroundings) != 0:
-            sx = 0.0
-            sy = 0.0
-            for xt, yt, temp in self.thermal_surroundings:
-                sx += xt
-                sy += yt
-            print(sx / len(self.thermal_surroundings), sy / len(self.thermal_surroundings))
+        self.update_state_thermal()
 
     def nfc_callback(self, _msg):
         self.update_state_nfc()
@@ -332,6 +333,8 @@ class AutoNav(Node):
                 "previous_state": self.state,
                 "previous_state_data": self.state_data,
             }
+        elif new_state == State.SEEK_TARGET:
+            self.state_data = { "target_angle": (yaw + kwargs.get("angle") ) }
         else:
             self.state_data = {}
         self.state = new_state
@@ -344,10 +347,11 @@ class AutoNav(Node):
             self.stopbot()
 
     def update_state_button(self):
-        print("Button pressed, resuming.")
-        self.state = self.state_data["previous_state"]
-        self.state_data = self.state_data["previous_state_data"]
-        self.loaded = True
+        if self.state == State.LOADING:
+            print("Button pressed, resuming.")
+            self.state = self.state_data["previous_state"]
+            self.state_data = self.state_data["previous_state_data"]
+            self.loaded = BALLS_LOADED
 
     def update_state_scan(self):
         x, y, yaw = self.current_location()
@@ -377,6 +381,33 @@ class AutoNav(Node):
                 self.change_state(State.TURN_LEFT)
             elif self.state_data["dist"] is not None and dist_to(*self.state_data["start"], x, y) >= self.state_data["dist"]:
                 self.change_state(State.FORWARD)
+        elif self.state == State.SEEK_TARGET:
+            _, achieved = turn_towards(yaw, self.state_data["target_angle"])
+            if achieved:
+                self.change_state(State.MOVE_TARGET)
+        elif self.state == State.MOVE_TARGET:
+            if self.blocked():
+                self.change_state(State.FIRING)
+
+    def update_state_thermal(self):
+        if not self.thermal_surroundings:
+            return
+
+        # Calculate average location of hot points
+        sx = 0.0
+        sy = 0.0
+        for xt, yt, temp in self.thermal_surroundings:
+            sx += xt
+            sy += yt
+            
+        ax = sx / len(self.thermal_surroundings)
+        ay = sy / len(self.thermal_surroundings)
+
+        print("Found heat at:", ax, ay)
+
+        if self.loaded != 0 and self.state != State.SEEK_TARGET:
+            self.change_state(State.SEEK_TARGET, angle = np.rad2deg(math.atan2(ax, ay)))
+
             
     def execute_state(self):
         x, y, yaw = self.current_location()
@@ -396,6 +427,19 @@ class AutoNav(Node):
             twist.linear.x = taper_move(self.laser_range[0])
         elif self.state == State.LOCKED_FORWARD:
             twist.linear.x = taper_move(self.laser_range[0])
+        elif self.state == State.SEEK_TARGET:
+            twist, _ = turn_towards(yaw, self.state_data["target_angle"])
+        elif self.state == State.MOVE_TARGET:
+            twist.linear.x = taper_move(self.laser_range[0])
+        elif self.state == State.FIRING:
+            self.stopbot()
+            time.sleep(1)
+            self.motor_publisher_.publish(Int32(data=1))
+            time.sleep(10)
+            while self.loaded > 0:
+                self.motor_publisher_.publish(Int32(data=2))
+                time.sleep(1)
+            self.change_state(State.DONE)
 
         if self.current_twist != twist:
             self.publisher_.publish(twist)

@@ -8,7 +8,7 @@ pwm = G.PWM(18, 1000)
 servo = G.PWM(22, 50)
 
 servo.start(7.5)
-for i in range(101):
+for i in range(51):
 	pwm.start(i)
 	time.sleep(0.1)
 
