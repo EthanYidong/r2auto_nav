@@ -22,7 +22,7 @@ class Motors(Node):
         GPIO.setup(18, GPIO.OUT)
         GPIO.setup(22, GPIO.OUT)
 
-        self.flywheels = GPIO.PWM(18, 1000)
+        self.flywheels = GPIO.PWM(18, 10000)
         self.servo = GPIO.PWM(22, 50)
         self.servo.start(7.5)
         self.get_logger().info("Motor runner started")
@@ -34,7 +34,7 @@ class Motors(Node):
         elif(cmd == 1):
             for i in range(51):
                 self.flywheels.start(i)
-                time.sleep(0.2)
+                time.sleep(0.01)
         elif(cmd == 2):
             self.servo.ChangeDutyCycle(10.5)
             time.sleep(0.5)
