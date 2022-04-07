@@ -29,7 +29,7 @@ import sys
 sys.setrecursionlimit(1000000)
 
 # How often to update and re-execute state
-UPDATE_PERIOD = 0.1
+UPDATE_PERIOD = 0.02
 
 # Robot Information
 ROBOT_FRONT = 0.14
@@ -70,15 +70,14 @@ TEMP_PERCENTILE = 50
 
 # How many balls we load
 BALLS_LOADED = 3
-FIRING_DIST = 0.30
 
 # How close to target before we taper speed
 TURN_TAPER_THRESHOLD = 10.0
 MOVE_TAPER_THRESHOLD = 0.5
 
 # How close to target angle before we stop
-TURNING_THRESHOLD = 5
-PRECISE_THRESHOLD = 0.5
+TURNING_THRESHOLD = 2
+PRECISE_THRESHOLD = 0.2
 
 # How close to the known sighting of NFC tag do we have to be to stop
 RETRACE_MARGIN = 0.05
@@ -86,8 +85,8 @@ RETRACE_MARGIN = 0.05
 # How fast to go
 TURNING_VEL = 1.4
 ADJUST_TURNING_VEL = 0.3
-PRECISE_TURNING_VEL = 0.4
-FORWARD_VEL = 0.21
+PRECISE_TURNING_VEL = 0.5
+FORWARD_VEL = 0.22
 
 # Threshold
 MAP_THRESHOLD = 50
@@ -101,7 +100,7 @@ DEBUG = True
 # Neighbors to check for DFS floodfill for map completion
 NBORS = [(-1, 0), (1, 0), (0, 1), (0, -1)]
 
-State = Enum('State', 'BEGIN SEEK MOVE_TO FORWARD TURN_LEFT TURN_RIGHT LOCKED_FORWARD LOADING SEEK_TARGET MOVE_TARGET FIRING DONE')
+State = Enum('State', 'BEGIN SEEK FORWARD TURN_LEFT TURN_RIGHT LOCKED_FORWARD LOADING SEEK_TARGET MOVE_TARGET FIRING DONE')
 
 def euler_from_quaternion(x, y, z, w):
     t0 = +2.0 * (w * x + y * z)
@@ -119,6 +118,7 @@ def euler_from_quaternion(x, y, z, w):
 
     return roll_x, pitch_y, yaw_z
 
+
 def angle_to(from_x, from_y, to_x, to_y):
     return math.atan2(to_y - from_y, to_x - from_x)
 
@@ -127,9 +127,6 @@ def dist_to(from_x, from_y, to_x, to_y):
 
 def angle_diff(f, t):
     return (360 + t - f) % 360
-
-def abs_angle_diff(f, t):
-    return min(angle_diff(f, t), angle_diff(t, f))
 
 def achieved_angle(diff, precise = False):
     if precise:
@@ -265,9 +262,9 @@ class AutoNav(Node):
         self.thermal = None
         self.seen_nfc = False
         self.toured = False
+        self.toured_infront = False
         self.nfc_loc = None
-        # TODO: change to 0 after debugging
-        self.maps_seen = 10
+        self.maps_seen = 0
         # TODO: change to 0 after debugging
         self.loaded = 0
 
@@ -345,22 +342,6 @@ class AutoNav(Node):
 
         return map_x, map_y, yaw - offset_yaw
 
-    def to_real_coords(self, x, y, yaw):
-        map_position = self.map_info.origin.position
-        map_orientation = self.map_info.origin.orientation
-        map_rotation = Rotation.from_quat([map_orientation.x, map_orientation.y, map_orientation.z, map_orientation.w])
-
-        rotated_offset = [y * self.map_info.resolution, x * self.map_info.resolution, 0]
-
-        offsets = map_rotation.apply(rotated_offset)
-
-        real_x = offsets[0] + map_position.x
-        real_y = offsets[1] + map_position.y
-
-        _, _, offset_yaw = euler_from_quaternion(map_orientation.x, map_orientation.y, map_orientation.z, map_orientation.w)
-
-        return real_x, real_y, yaw + offset_yaw
-
     def valid_point(self, x, y):
         return x >= 0 and x < np.size(self.occdata, 0) and y >= 0 and y < np.size(self.occdata, 1)
 
@@ -380,11 +361,7 @@ class AutoNav(Node):
     def generate_raycast(self, map_x, map_y, map_yaw):
         raycast = np.full_like(self.occdata, 0, dtype=np.int32)
 
-        slope = -1 / math.tan(np.deg2rad(map_yaw))
-        print(slope)
-
-        head_1 = None
-        head_2 = None
+        slope = 1 / math.tan(np.rad2deg(map_yaw))
 
         dx = 0
         while True:
@@ -396,7 +373,6 @@ class AutoNav(Node):
                 to_mark = reversed(to_mark)
             for cy in to_mark:
                 if not self.valid_point(cx, cy) or self.occdata[cx][cy] >= MAP_THRESHOLD:
-                    head_1 = [cx, cy]
                     break
                 raycast[cx][cy] = 1
             else:
@@ -414,16 +390,14 @@ class AutoNav(Node):
                 to_mark = reversed(to_mark)
             for cy in to_mark:
                 if not self.valid_point(cx, cy) or self.occdata[cx][cy] >= MAP_THRESHOLD:
-                    head_2 = [cx, cy]
                     break
-                
                 raycast[cx][cy] = 1
             else:
                 dx -= 1
                 continue
             break
         
-        return raycast, head_1, head_2
+        return raycast
 
     def floodfill_infront(self, map_x, map_y):
         if map_x == 0 or map_x == np.size(self.occdata, 0) - 1 or map_y == 0 or map_y == np.size(self.occdata, 1):
@@ -456,7 +430,6 @@ class AutoNav(Node):
             map_x, map_y, map_yaw = self.to_map_coords(self.x, self.y, self.yaw)
             self.floodfill_vis = np.full_like(self.occdata, 0, dtype=np.int32)
             self.toured = self.floodfill_edges(map_x, map_y)
-            np.savetxt("occ.txt", self.floodfill_vis)
 
             if self.toured:
                 print("Tour complete!")
@@ -520,8 +493,6 @@ class AutoNav(Node):
             }
         elif new_state == State.SEEK_TARGET:
             self.state_data = { "target_angle": (self.yaw + kwargs.get("angle") ) }
-        elif new_state == State.MOVE_TO:
-            self.state_data = { "head_x": kwargs["head_x"], "head_y": kwargs["head_y"] }
         else:
             self.state_data = {}
         self.state = new_state
@@ -531,9 +502,7 @@ class AutoNav(Node):
     def update_state_occ(self):
         if not self.toured and (self.state == State.FORWARD or self.state == State.TURN_LEFT or self.state == State.TURN_RIGHT):
             max_yaw = None
-            correct_head_x = None
-            correct_head_y = None
-            for i in range(1):
+            for i in range(90):
                 try_yaw = (self.yaw + i) % 360
 
                 map_x, map_y, map_yaw = self.to_map_coords(self.x, self.y, try_yaw)
@@ -543,24 +512,17 @@ class AutoNav(Node):
                 rot = np.array([[math.cos(yaw_rad), -math.sin(yaw_rad)], [math.sin(yaw_rad), math.cos(yaw_rad)]])
                 
                 p = np.array([ROBOT_BACK, 0])
-                #p = np.array([0, 0])
                 trans = np.dot(rot, p)
 
                 back_x = self.x + trans[0]
                 back_y = self.y + trans[1]
                 
                 map_back_x, map_back_y, _ = self.to_map_coords(back_x, back_y, try_yaw)
-                if not self.valid_point(map_back_x, map_back_y):
-                    break
-                self.raycast, head_1, head_2 = self.generate_raycast(map_back_x, map_back_y, try_yaw)
 
-                real_head_1_x, real_head_1_y, _ = self.to_real_coords(*head_1, 0)
-                if np.cross(np.array([real_head_1_x, real_head_1_y]) - np.array([self.x, self.y]), -trans) < 0:
-                    head_x, head_y = head_1
-                else:
-                    head_x, head_y = head_2
+                self.raycast = self.generate_raycast(map_back_x, map_back_y, try_yaw)
                 
                 start_point = [map_back_x, map_back_y]
+
                 
                 p = np.array([0.02, 0])
                 trans = np.dot(rot, p)
@@ -573,26 +535,23 @@ class AutoNav(Node):
                     cy += trans[1]
                     start_point[0], start_point[1], _ = self.to_map_coords(cx, cy, try_yaw)
 
-                if self.floodfill_infront(*start_point):
+                self.toured_infront = self.floodfill_infront(*start_point)
+                
+                if self.toured_infront:
+                    for x in range(np.size(self.raycast, 0)):
+                        for y in range(np.size(self.raycast, 1)):
+                            if self.raycast[x][y] == 1:
+                                self.floodfill_vis[x][y] += 2
+                            
+                    self.floodfill_vis[map_x][map_y] = 4
+                    self.floodfill_vis[start_point[0]][start_point[1]] = 5
+                    np.savetxt("toured_infront.txt", self.floodfill_vis)
+                
+                if self.toured_infront:
                     max_yaw = i
-                    print(head_x, head_y)
-                    correct_head_x, correct_head_y, _ = self.to_real_coords(head_x, head_y, 0)
-                else:
-                    break
-            if max_yaw is not None:
-                self.change_state(State.MOVE_TO, head_x = correct_head_x, head_y = correct_head_y)
+            if max_yaw:
+                self.change_state(State.SEEK, target_angle = max_yaw + 85.0 , precise = True)
                 print("Already explored, skipping")
-            
-            for x in range(np.size(self.raycast, 0)):
-                    for y in range(np.size(self.raycast, 1)):
-                        if self.raycast[x][y] == 1:
-                            self.floodfill_vis[x][y] += 2
-            self.floodfill_vis[map_x][map_y] = 4
-            if self.valid_point(start_point[0], start_point[1]):
-                self.floodfill_vis[start_point[0]][start_point[1]] = 5
-            if self.valid_point(head_x, head_y):
-                self.floodfill_vis[head_x][head_y] = 8
-            np.savetxt("toured_infront.txt", self.floodfill_vis)
 
     def update_state_nfc(self):
         if self.toured:
@@ -631,15 +590,11 @@ class AutoNav(Node):
         elif self.state == State.LOCKED_FORWARD:
             if self.front() < LOOKAHEAD:
                 self.change_state(State.TURN_LEFT)
-        elif self.state == State.MOVE_TO:
-            _, achieved = turn_towards(self.yaw, np.rad2deg(angle_to(self.x, self.y, self.state_data["head_x"], self.state_data["head_y"])), False)
-            if achieved and self.front() < LOOKAHEAD:
-                    self.change_state(State.TURN_LEFT)
         elif self.state == State.MOVE_TARGET:
             pass
             # todo: rework
-            if self.front_left() <= FIRING_DIST:
-                self.change_state(State.FIRING)
+            #if self.front_left() <= PADDING * 6:
+            #    self.change_state(State.FIRING)
         if RANDOMIZE and self.toured and self.seen_nfc:
             if random.randint(0, 50)  == 0:
                 self.change_state(State.SEEK, target_angle=90.0)
@@ -712,16 +667,11 @@ class AutoNav(Node):
         elif self.state == State.TURN_RIGHT:
             twist.angular.z = -TURNING_VEL
         elif self.state == State.LOCKED_FORWARD:
-            twist.linear.x = FORWARD_VEL
+            twist.linear.x = taper_move(self.laser_range[0])
         elif self.state == State.SEEK_TARGET:
             twist, _ = turn_towards(self.yaw, self.state_data["target_angle"], True)
         elif self.state == State.MOVE_TARGET:
             twist.linear.x = taper_move(self.laser_range[0])
-        elif self.state == State.MOVE_TO:
-            twist, achieved = turn_towards(self.yaw, np.rad2deg(angle_to(self.x, self.y, self.state_data["head_x"], self.state_data["head_y"])), False)
-            if achieved:
-                twist.angular.z = 0.0
-                twist.linear.x = FORWARD_VEL
         elif self.state == State.FIRING:
             self.stopbot()
             time.sleep(1)
