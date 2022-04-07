@@ -32,9 +32,9 @@ class Motors(Node):
         if(cmd == 0):
             self.flywheels.start(0)
         elif(cmd == 1):
-            for i in range(51):
+            for i in range(101):
                 self.flywheels.start(i)
-                time.sleep(0.01)
+                time.sleep(0.05)
         elif(cmd == 2):
             self.servo.ChangeDutyCycle(10.5)
             time.sleep(0.5)

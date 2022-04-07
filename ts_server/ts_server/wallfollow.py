@@ -42,7 +42,7 @@ ROBOT_LEN = ROBOT_FRONT - ROBOT_BACK
 
 # How far ahead to check for walls
 LOOKAHEAD = 0.10
-ADJUSTLOOKAHEAD = 0.20
+ADJUSTLOOKAHEAD = 0.30
 ADJUSTLOOKRIGHT = 0.05
 LOOKRIGHT = 0.20
 
@@ -77,17 +77,19 @@ TURN_TAPER_THRESHOLD = 10.0
 MOVE_TAPER_THRESHOLD = 0.5
 
 # How close to target angle before we stop
-TURNING_THRESHOLD = 5
+TURNING_THRESHOLD = 10
 PRECISE_THRESHOLD = 0.5
 
 # How close to the known sighting of NFC tag do we have to be to stop
 RETRACE_MARGIN = 0.05
+MOVETO_MARGIN = 0.20
 
 # How fast to go
-TURNING_VEL = 1.4
+TURNING_VEL = 0.8
 ADJUST_TURNING_VEL = 0.3
 PRECISE_TURNING_VEL = 0.4
 FORWARD_VEL = 0.21
+ADJUST_FORWARD_VEL = 0.18
 
 # Threshold
 MAP_THRESHOLD = 50
@@ -101,7 +103,7 @@ DEBUG = True
 # Neighbors to check for DFS floodfill for map completion
 NBORS = [(-1, 0), (1, 0), (0, 1), (0, -1)]
 
-State = Enum('State', 'BEGIN SEEK MOVE_TO FORWARD TURN_LEFT TURN_RIGHT LOCKED_FORWARD LOADING SEEK_TARGET MOVE_TARGET FIRING DONE')
+State = Enum('State', 'BEGIN SEEK MOVE_TO FORWARD TURN_LEFT TURN_RIGHT LOCKED_FORWARD LOADING MOVE_TARGET FIRING DONE')
 
 def euler_from_quaternion(x, y, z, w):
     t0 = +2.0 * (w * x + y * z)
@@ -518,9 +520,9 @@ class AutoNav(Node):
                 "previous_state": self.state,
                 "previous_state_data": self.state_data,
             }
-        elif new_state == State.SEEK_TARGET:
-            self.state_data = { "target_angle": (self.yaw + kwargs.get("angle") ) }
         elif new_state == State.MOVE_TO:
+            self.state_data = { "head_x": kwargs["head_x"], "head_y": kwargs["head_y"], "start": (self.x, self.y) }
+        elif new_state == State.MOVE_TARGET:
             self.state_data = { "head_x": kwargs["head_x"], "head_y": kwargs["head_y"] }
         else:
             self.state_data = {}
@@ -529,12 +531,12 @@ class AutoNav(Node):
         self.execute_state()
 
     def update_state_occ(self):
-        if not self.toured and (self.state == State.FORWARD or self.state == State.TURN_LEFT or self.state == State.TURN_RIGHT):
+        if not self.toured and (self.state == State.FORWARD or self.state == State.TURN_LEFT or self.state == State.TURN_RIGHT or self.state == State.MOVE_TO):
             max_yaw = None
             correct_head_x = None
             correct_head_y = None
-            for i in range(1):
-                try_yaw = (self.yaw + i) % 360
+            for i in range(5):
+                try_yaw = (self.yaw - i) % 360
 
                 map_x, map_y, map_yaw = self.to_map_coords(self.x, self.y, try_yaw)
                 self.floodfill_vis = np.full_like(self.occdata, 0, dtype=np.int32)
@@ -632,14 +634,21 @@ class AutoNav(Node):
             if self.front() < LOOKAHEAD:
                 self.change_state(State.TURN_LEFT)
         elif self.state == State.MOVE_TO:
+            if self.x is None:
+                return
             _, achieved = turn_towards(self.yaw, np.rad2deg(angle_to(self.x, self.y, self.state_data["head_x"], self.state_data["head_y"])), False)
-            if achieved and self.front() < LOOKAHEAD:
+            if achieved:
+                if np.nanargmin(self.laser_range) < MOVETO_MARGIN and dist_to(*self.state_data["start"], self.x, self.y) > MOVETO_MARGIN:
+                    self.change_state(State.SEEK, target_angle = np.nanargmin(self.laser_range))
+                elif self.front() < LOOKAHEAD:
                     self.change_state(State.TURN_LEFT)
         elif self.state == State.MOVE_TARGET:
-            pass
-            # todo: rework
-            if self.front_left() <= FIRING_DIST:
-                self.change_state(State.FIRING)
+            if self.x is None:
+                return
+            _, achieved = turn_towards(self.yaw, np.rad2deg(angle_to(self.x, self.y, self.state_data["head_x"], self.state_data["head_y"])), False)
+            if achieved:
+                if self.front() < FIRING_DIST:
+                    self.change_state(State.FIRING)
         if RANDOMIZE and self.toured and self.seen_nfc:
             if random.randint(0, 50)  == 0:
                 self.change_state(State.SEEK, target_angle=90.0)
@@ -652,10 +661,6 @@ class AutoNav(Node):
             _, achieved = turn_towards(self.yaw, self.state_data["target_angle"], self.state_data["precise"])
             if achieved:
                 self.change_state(State.LOCKED_FORWARD)
-        elif self.state == State.SEEK_TARGET:
-            _, achieved = turn_towards(self.yaw, self.state_data["target_angle"], True)
-            if achieved:
-                self.change_state(State.MOVE_TARGET)
         elif self.state == State.TURN_RIGHT:
             if min((self.yaw - self.state_data["start_angle"] + 360) % 360, 360 - (self.yaw - self.state_data["start_angle"] + 360) % 360) >= 90:
                 self.change_state(State.LOCKED_FORWARD, dist=ROBOT_LEN)
@@ -685,9 +690,9 @@ class AutoNav(Node):
 
         print("Found heat at:", ax, ay)
 
-        if len(self.thermal_surroundings) >= 5 and self.loaded != 0 and self.state != State.SEEK_TARGET:
+        if len(self.thermal_surroundings) >= 5 and self.loaded != 0 and self.state != State.MOVE_TARGET:
             if self.toured:
-                self.change_state(State.SEEK_TARGET, angle = np.rad2deg(math.atan2(ay, ax)))
+                self.change_state(State.MOVE_TARGET, head_x = ax, head_y = ay)
             else:
                 print("Found target, but waiting for tour completion first")
 
@@ -703,7 +708,7 @@ class AutoNav(Node):
         if self.state == State.SEEK:
             twist, _ = turn_towards(self.yaw, self.state_data["target_angle"], self.state_data["precise"])
         elif self.state == State.FORWARD:
-            twist.linear.x = FORWARD_VEL
+            twist.linear.x = ADJUST_FORWARD_VEL
             twist.angular.z = -ADJUST_TURNING_VEL
             if self.front_right_half() < ADJUSTLOOKAHEAD:
                 twist.angular.z = ADJUST_TURNING_VEL
@@ -713,10 +718,11 @@ class AutoNav(Node):
             twist.angular.z = -TURNING_VEL
         elif self.state == State.LOCKED_FORWARD:
             twist.linear.x = FORWARD_VEL
-        elif self.state == State.SEEK_TARGET:
-            twist, _ = turn_towards(self.yaw, self.state_data["target_angle"], True)
         elif self.state == State.MOVE_TARGET:
-            twist.linear.x = taper_move(self.laser_range[0])
+            twist, achieved = turn_towards(self.yaw, np.rad2deg(angle_to(self.x, self.y, self.state_data["head_x"], self.state_data["head_y"])), False)
+            if achieved:
+                twist.angular.z = 0.0
+                twist.linear.x = FORWARD_VEL
         elif self.state == State.MOVE_TO:
             twist, achieved = turn_towards(self.yaw, np.rad2deg(angle_to(self.x, self.y, self.state_data["head_x"], self.state_data["head_y"])), False)
             if achieved:
@@ -726,7 +732,7 @@ class AutoNav(Node):
             self.stopbot()
             time.sleep(1)
             self.motor_publisher_.publish(Int32(data=1))
-            time.sleep(3)
+            time.sleep(10)
             while self.loaded > 0:
                 self.motor_publisher_.publish(Int32(data=2))
                 time.sleep(1)
