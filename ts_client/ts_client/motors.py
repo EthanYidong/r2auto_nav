@@ -1,5 +1,6 @@
 import time
-
+import threading
+import pigpio
 import RPi.GPIO as GPIO
 
 import rclpy
@@ -18,23 +19,28 @@ class Motors(Node):
             self.motor_callback,
             qos_profile_sensor_data)
 
+        self.pi = pigpio.pi()
+
         GPIO.setmode(GPIO.BOARD)
-        GPIO.setup(18, GPIO.OUT)
+
+        self.pi.set_mode(18, pigpio.OUTPUT)
         GPIO.setup(22, GPIO.OUT)
 
-        self.flywheels = GPIO.PWM(18, 10000)
         self.servo = GPIO.PWM(22, 50)
         self.servo.start(7.5)
+
+        self.motor_thread = None
+
         self.get_logger().info("Motor runner started")
 
     def motor_callback(self, msg):
         cmd = msg.data
         if(cmd == 0):
-            self.flywheels.start(0)
+            self.pi.hardware_PWM(18, 10000, 0)
         elif(cmd == 1):
-            for i in range(101):
-                self.flywheels.start(i)
-                time.sleep(0.05)
+            for i in range(100):
+                self.pi.hardware_PWM(18, 10000, 10000 * i)
+                time.sleep(0.02)
         elif(cmd == 2):
             self.servo.ChangeDutyCycle(10.5)
             time.sleep(0.5)
@@ -42,11 +48,11 @@ class Motors(Node):
         pass
                 
 def main(args=None):
-	rclpy.init(args=args)
-	motor_pub = Motors()
-	rclpy.spin(motor_pub)
-	motor_pub.destroy_node()
-	rclpy.shutdown()
+    rclpy.init(args=args)
+    motor_pub = Motors()
+    rclpy.spin(motor_pub)
+    motor_pub.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
-	main()
+    main()
