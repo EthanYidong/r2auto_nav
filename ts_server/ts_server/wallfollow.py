@@ -77,7 +77,7 @@ TEMP_PERCENTILE = 50
 
 # How many balls we load
 BALLS_LOADED = 3
-FIRING_DIST = 0.10
+FIRING_DIST = 0.05
 
 # How close to target before we taper speed
 TURN_TAPER_THRESHOLD = 10.0
@@ -492,7 +492,6 @@ class AutoNav(Node):
         self.odom = msg
         self.x, self.y, self.yaw = self.current_location()
         self.update_state_odom()
-        self.update_state_skip()
         self.execute_state()
 
     def occ_callback(self, msg):
@@ -502,7 +501,7 @@ class AutoNav(Node):
         self.map_info = msg.info
         self.maps_seen += 1
 
-        if self.maps_seen > 2 and not self.toured:
+        if self.maps_seen % 5 == 0 and not self.toured:
             if self.x is None:
                 return
             map_x, map_y, map_yaw = self.to_map_coords(self.x, self.y, self.yaw)
@@ -596,7 +595,7 @@ class AutoNav(Node):
     def update_state_skip(self):
         if self.x is None:
             return
-        if SKIP and not self.toured and (self.state == State.FORWARD or self.state == State.TURN_LEFT or self.state == State.TURN_RIGHT):
+        if SKIP and not self.toured and (self.state == State.FORWARD or self.state == State.TURN_LEFT or self.state == State.TURN_RIGHT or self.state == State.MOVE_TO):
             max_yaw = None
             correct_head_x = None
             correct_head_y = None
