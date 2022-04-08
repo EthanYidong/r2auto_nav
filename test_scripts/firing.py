@@ -1,16 +1,19 @@
 import RPi.GPIO as G
+import pigpio
 import time
 
+pi = pigpio.pi()
 G.setmode(G.BOARD)
-G.setup(18, G.OUT)
+
+pi.set_mode(18, pigpio.OUTPUT)
 G.setup(22, G.OUT)
-pwm = G.PWM(18, 1000)
 servo = G.PWM(22, 50)
 
 servo.start(7.5)
-for i in range(51):
-	pwm.start(i)
-	time.sleep(0.2)
+
+for i in range(100):
+    pi.hardware_PWM(18, 10000, 10000 * i)
+    time.sleep(0.01)
 
 print("spun up!")
 
@@ -22,5 +25,6 @@ try:
         servo.ChangeDutyCycle(7.5)
 except:
     servo.ChangeDutyCycle(7.5)
-    pwm.stop()
+    pi.hardware_PWM(18, 10000, 0)
+    pi.stop()
     time.sleep(0.5)
