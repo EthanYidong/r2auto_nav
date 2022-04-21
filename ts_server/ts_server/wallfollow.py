@@ -1,3 +1,4 @@
+# Python std dependencies
 from collections import deque
 from enum import Enum
 from http.client import FOUND
@@ -5,10 +6,13 @@ import math
 import cmath
 import time
 import traceback
+import random
 
+# ros dependencies
 import rclpy
 from rclpy.node import Node
 
+# ros messaging dependencies
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist, PoseStamped
 from rclpy.qos import qos_profile_sensor_data
@@ -16,15 +20,16 @@ from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid
 from std_msgs.msg import Float32MultiArray, Int32, Empty
 
-import random
-
+# External library dependencies
 import numpy as np
 import tf2_ros
 from scipy.spatial.transform import Rotation
 import matplotlib.pyplot as plt
 
+# Transform helper code
 from .conv import *
 
+# Update recursion limit to ensure that dfs does not fail
 import sys
 
 sys.setrecursionlimit(1000000)
@@ -32,7 +37,7 @@ sys.setrecursionlimit(1000000)
 # How often to update and re-execute state
 UPDATE_PERIOD = 0.1
 
-# Robot Information
+# Robot geometry information
 ROBOT_FRONT = 0.14
 ROBOT_LEFT = 0.12
 ROBOT_RIGHT = -0.12
@@ -41,10 +46,13 @@ ROBOT_LEN = ROBOT_FRONT - ROBOT_BACK
 
 # Surroundings definition
 
-# How far ahead to check for walls
+# How far ahead to check for walls to indicate hard left turn
 LOOKAHEAD = 0.10
+# How far ahead to check for walls to indicate soft left turn
 ADJUSTLOOKAHEAD = 0.30
+# How far right to check for walls to indicate soft right turn
 ADJUSTLOOKRIGHT = 0.05
+# How far right to check for walls to indicate hard right turn
 LOOKRIGHT = 0.20
 
 # Wall distance to the right check
@@ -122,8 +130,23 @@ SKIP = False
 # Neighbors to check for DFS floodfill for map completion
 NBORS = [(-1, 0), (1, 0), (0, 1), (0, -1)]
 
+# State Enum
+# BEGIN = the starting state, nothing happens except waiting for the lidar data and moving towards the closest wall
+# SEEK = turn towards an angle, and then move forward locked until the robot meets the wall
+# MOVE_TO = move towards a point, assume no obstacles in between
+# FORWARD = move forwards, assume the wall is to the right
+# TURN_LEFT = turn left until the wall is no longer in front
+# TURN_RIGHT = turn right 90 degrees
+# LOCKED_FORWARD = move forward but do not turn right (used to prevent turning right again immediately after turning right once)
+# LOADING = wait for button press
+# MOVE_TARGET = move towards a heat signature until a certain distance is achieved
+# GATHER_TARGET = stay still and read from the thermal camera until enough data is collected
+# AIM = turn around to a precise angle calculated from the target data gathered in the GATHER_TARGET state
+# FIRING = repeatedly send messages to the servo to push balls until all balls have been fired
+# DONE = done
 State = Enum('State', 'BEGIN SEEK MOVE_TO FORWARD TURN_LEFT TURN_RIGHT LOCKED_FORWARD LOADING MOVE_TARGET GATHER_TARGET AIM FIRING DONE')
 
+# Helper code to conver quaternion to euler rotations (in radians)
 def euler_from_quaternion(x, y, z, w):
     t0 = +2.0 * (w * x + y * z)
     t1 = +1.0 - 2.0 * (x * x + y * y)
@@ -140,23 +163,29 @@ def euler_from_quaternion(x, y, z, w):
 
     return roll_x, pitch_y, yaw_z
 
+# Determine the angle between two points on a 2D grid
 def angle_to(from_x, from_y, to_x, to_y):
     return math.atan2(to_y - from_y, to_x - from_x)
 
+# Determine the distance between two points on a 2D grid
 def dist_to(from_x, from_y, to_x, to_y):
     return math.sqrt((to_y - from_y) ** 2 + (to_x - from_x) ** 2)
 
+# Determine the clockwise rotation from one angle to another, in degrees
 def angle_diff(f, t):
     return (360 + t - f) % 360
 
+# Determine the shortest rotation from one angle to another, in degrees
 def abs_angle_diff(f, t):
     return min(angle_diff(f, t), angle_diff(t, f))
 
+# Determine if two angles are "close enough", defined by constant thresholds above
 def achieved_angle(diff, precise = False):
     if precise:
         return diff < PRECISE_THRESHOLD or diff > 360.0 - PRECISE_THRESHOLD
     return diff < TURNING_THRESHOLD or diff > 360.0 - TURNING_THRESHOLD
 
+# Return a twist that moves the bot forward and turns the bot simultaneously, slowing down the bot as it approaches a desired angle
 def turn_move_towards(yaw, target, precise = False):
     twist = Twist()
     diff = angle_diff(yaw, target)
@@ -172,6 +201,7 @@ def turn_move_towards(yaw, target, precise = False):
         twist.angular.z = -TURNING_VEL
     return twist, False
 
+# Return a twist that turns the bot, slowing down the bot as it approaches a desired angle
 def turn_towards(yaw, target, precise = False):
     twist = Twist()
     diff = angle_diff(yaw, target)
@@ -184,12 +214,14 @@ def turn_towards(yaw, target, precise = False):
         twist.angular.z = -taper_turn(360 - diff, precise)
     return twist, False
 
+# Helper function to taper the speed of a turn right
 def scale_right_turn(delta):
     twist = Twist()
     twist.linear.x = FORWARD_VEL
     twist.angular.z = -(min(delta, 0.03) / 0.03) * TURNING_VEL
     return twist
 
+# Helper function to taper the speed of a turn left
 def scale_left_turn(delta):
     twist = Twist()
     twist.linear.x = FORWARD_VEL
@@ -198,6 +230,7 @@ def scale_left_turn(delta):
         twist.linear.x = 0.0
     return twist
 
+# Helper function to taper the speed of a turn
 def taper_turn(delta, precise = False):
     if delta > TURN_TAPER_THRESHOLD:
         if precise:
@@ -205,13 +238,15 @@ def taper_turn(delta, precise = False):
         return TURNING_VEL
     else:
         return ADJUST_TURNING_VEL
-
+    
+# Helper function to taper the speed of a move forward
 def taper_move(delta):
     if delta > MOVE_TAPER_THRESHOLD:
         return FORWARD_VEL
     else:
         return (MOVE_TAPER_THRESHOLD - delta) / MOVE_TAPER_THRESHOLD * (FORWARD_VEL - MIN_FORWARD_VEL) + MIN_FORWARD_VEL
 
+# Helper function to convert lidar readings into a point cloud of obstacles
 def generate_surroundings(laser_range):
     laser_surroundings = []
     for deg, dist in enumerate(laser_range):
@@ -223,6 +258,7 @@ def generate_surroundings(laser_range):
             laser_surroundings.append(p_rot)
     return laser_surroundings
 
+# Helper function to convert an angle in degrees to the index on the array returned by the thermal camera
 def mlx_index(angle):
     if angle >= -THERMAL_ANGLE_BOUNDS and angle <= THERMAL_ANGLE_BOUNDS:
         index = int(round((angle + THERMAL_FOV / 2) / THERMAL_FOV * THERMAL_WIDTH))
@@ -237,6 +273,7 @@ class AutoNav(Node):
         self.motor_publisher_ = self.create_publisher(Int32,'motor',10)
         
 
+        # Set up subscriptions to needed topics
         self._odom_subscription = self.create_subscription(
             Odometry,
             'odom',
@@ -277,40 +314,63 @@ class AutoNav(Node):
 
         self.tfBuffer = tf2_ros.Buffer(rclpy.duration.Duration(seconds=60))
         self.tfListener = tf2_ros.TransformListener(self.tfBuffer, self)
-
+        
+        # Array of laser ranges returned by lidar
         self.laser_range = None
+        # Point cloud generated by lidar
         self.laser_surroundings = None
+        # Raw msg sent by lidar publisher
         self.scan_data = None
 
+        # Point cloud of locations that have detected heat signatures
         self.thermal_surroundings = None
 
+        # Occupancy map
         self.occdata = None
+        # Occupancy map with a rear raycast included, which only checks for map completion behind the bot (only used for skipping algorithm)
         self.raycast = None
+        # Amount of area behind the bot
         self.area = 0
 
+        # Occupancy map metadata
         self.map_info = None
 
+        # Odometry data returned by odom publisher
         self.odom = None
+        # Base link calculated by tf2 listener
         self.base_link = None
+        
+        # x, y, and yaw in m and degrees, calculated from base_link.
         self.x = None
         self.y = None
         self.yaw = None
 
+        # Current motor state, last published
         self.current_twist = None
 
+        # Thermal data returned by thermal publisher
         self.thermal = None
+        
+        # If the bot has stopped at an NFC, it will be set to true.
         self.seen_nfc = False
-        # TODO: change to False after debugging
+        # Whether or not the bot has finished a full round around the maze.
+        # Manually set to True to test firing only.
         self.toured = False
+        
+        # Known NFC location, if it has been detected before the tour is completed
         self.nfc_loc = None
-        # TODO: change to 0 after debugging
+        # Number of occupancy maps seen so far. Do not attempt to detect for tour completion until this reaches a certain threshold, because early maps are inaccurate.
+        
         self.maps_seen = 0
-        # TODO: change to 0 after debugging
+        # Number of balls loaded.
+        # Set to BALLS_LOADED to test firing only.
         self.loaded = 0
 
+        # Initial state
         self.state = State.BEGIN
         self.state_data = {}
 
+        # If a live map should be drawn, then set up matplotlib.
         if DRAW:
             # Plot config
             plt.ion()
@@ -319,9 +379,11 @@ class AutoNav(Node):
 
             plt.show()
 
+    # Helper function to determine if the bot is in a targeting state. If so, no interruptions should be made.
     def is_target_state(self):
         return (self.state == State.AIM) or (self.state == State.FIRING) or (self.state == State.GATHER_TARGET) or (self.state == State.MOVE_TARGET)
 
+    # Get the current location of the bot.
     def current_location(self):
         start = time.time_ns()
         if self.odom is None:
@@ -332,6 +394,7 @@ class AutoNav(Node):
         )
 
         last_error = None
+        # Because the odom -> map transform may not be up to date due to latency, check older timing until we find a suitable transform. 
         for _tries in range(20):
             try:
                 base_link = self.tfBuffer.transform(odom_pose, 'map')
@@ -356,6 +419,7 @@ class AutoNav(Node):
             print(f"found time in {ms} ms")
         return base_link.pose.position.x, base_link.pose.position.y, np.rad2deg(yaw)
 
+    # Check the front for obstacles
     def front(self):
         backmost = math.inf
         for x, y in self.laser_surroundings:
@@ -363,6 +427,7 @@ class AutoNav(Node):
                 backmost = min(x, backmost)
         return backmost - ROBOT_FRONT
 
+    # Check the front right for obstacles
     def front_right_half(self):
         backmost = math.inf
         for x, y in self.laser_surroundings:
@@ -370,6 +435,7 @@ class AutoNav(Node):
                 backmost = min(x, backmost)
         return backmost - ROBOT_FRONT
     
+    # Check the right for obstacles
     def right(self):
         leftmost = -math.inf
         for x, y in self.laser_surroundings:
@@ -377,6 +443,7 @@ class AutoNav(Node):
                 leftmost = max(y, leftmost)
         return ROBOT_RIGHT - leftmost
     
+    # Convert a coordinate given in meters relative to the map origin, into indexes for the occupancy map
     def to_map_coords(self, x, y, yaw):
         map_position = self.map_info.origin.position
         map_orientation = self.map_info.origin.orientation
@@ -393,6 +460,7 @@ class AutoNav(Node):
 
         return map_x, map_y, yaw - offset_yaw
 
+    # Inverse function of to_map_coords, convert a given map index into real coordinates
     def to_real_coords(self, x, y, yaw):
         map_position = self.map_info.origin.position
         map_orientation = self.map_info.origin.orientation
@@ -409,9 +477,12 @@ class AutoNav(Node):
 
         return real_x, real_y, yaw + offset_yaw
 
+    # Check if an index is within the map
     def valid_point(self, x, y):
         return x >= 0 and x < np.size(self.occdata, 0) and y >= 0 and y < np.size(self.occdata, 1)
 
+    # DFS and attempt to reach the edge by only moving through traversable or unknown grid squares.
+    # If we can reach the edge, then the map is incomplete.
     def floodfill_edges(self, x, y):
         if x == 0 or x == np.size(self.occdata, 0) - 1 or y == 0 or y == np.size(self.occdata, 1):
             return False
@@ -425,6 +496,7 @@ class AutoNav(Node):
                         return False
         return True
 
+    # Draw a line on the map behind the bot, perpendicular to its current heading.
     def generate_raycast(self, map_x, map_y, map_yaw):
         raycast = np.full_like(self.occdata, 0, dtype=np.int32)
 
@@ -472,6 +544,9 @@ class AutoNav(Node):
         
         return raycast, head_1, head_2
 
+    # After blocking off a line of squares behind the bot, check if we can still reach the edge.
+    # If not, that means that everything in front has been explored.
+    # Therefore, we can make a 90 degree turn left to skip past the section.
     def floodfill_infront(self, map_x, map_y):
         total = 1
         if map_x == 0 or map_x == np.size(self.occdata, 0) - 1 or map_y == 0 or map_y == np.size(self.occdata, 1):
@@ -488,6 +563,7 @@ class AutoNav(Node):
                     total += new_total
         return True, total
 
+    # Update location on new odom data
     def odom_callback(self, msg):
         self.odom = msg
         self.x, self.y, self.yaw = self.current_location()
@@ -501,6 +577,7 @@ class AutoNav(Node):
         self.map_info = msg.info
         self.maps_seen += 1
 
+        # Every 5 maps, check if the tour has been completed (this takes about ~0.1 seconds, which will cause latency issues if run too frequently)
         if self.maps_seen % 5 == 0 and not self.toured:
             if self.x is None:
                 return
@@ -526,6 +603,7 @@ class AutoNav(Node):
         self.laser_range = np.array(msg.ranges)
         self.laser_range[self.laser_range==0] = np.inf
         self.scan_data = msg
+        # Generate point cloud for use to locate obstacles and target
         self.laser_surroundings = generate_surroundings(self.laser_range)
 
         self.update_state_scan()
@@ -536,6 +614,7 @@ class AutoNav(Node):
         self.thermal = msgdata.reshape([24,32])
         self.thermal_surroundings = []
         if self.laser_surroundings is not None:
+            # Generate thermal point cloud
             for x, y in self.laser_surroundings:
                 dx = x - THERMAL_X
                 dy = y - THERMAL_Y
@@ -562,6 +641,7 @@ class AutoNav(Node):
     def timer_callback(self):
         self.execute_state()
 
+    # Function to change state. New state is logged, and any extra data that the state needs to operate is generated
     def change_state(self, new_state, **kwargs):
         if self.x is None:
             self.stopbot()
@@ -592,6 +672,8 @@ class AutoNav(Node):
         print("state", self.state, self.state_data)
         self.execute_state()
 
+    # Function to update state to State.MOVE_TO, with the target point being the detected wall on the robot's left.
+    # This occurs if everything in front has been detected to be explored.
     def update_state_skip(self):
         if self.x is None:
             return
@@ -599,6 +681,7 @@ class AutoNav(Node):
             max_yaw = None
             correct_head_x = None
             correct_head_y = None
+            # Increase range size to increase aggressiveness of skipping. Testing shows that values above 30 cause issues with the bot turning around in a loop.
             for i in range(1):
                 try_yaw = (self.yaw + i) % 360
 
@@ -664,7 +747,8 @@ class AutoNav(Node):
 
                 else:
                     break
-                
+       
+    # Update state if NFC detected for the first time after tour completion
     def update_state_nfc(self):
         if self.toured:
             if not self.seen_nfc:
@@ -677,6 +761,7 @@ class AutoNav(Node):
                 return
             self.nfc_loc = (self.x, self.y)
 
+    # Update state if button pressed while loading NFC
     def update_state_button(self):
         if self.state == State.LOADING:
             print("Button pressed, resuming.")
@@ -684,24 +769,31 @@ class AutoNav(Node):
             self.state_data = self.state_data["previous_state_data"]
             self.loaded = BALLS_LOADED
 
+    # Multiple different situations to update state when lidar scan is recieved
     def update_state_scan(self):
         if self.state == State.BEGIN:
             if self.laser_range is not None:
                 self.change_state(State.SEEK, target_angle = np.nanargmin(self.laser_range))
+        # If moving forward, turn right if there is no wall to the right, and turn left if there is a wall in front.
         elif self.state == State.FORWARD:
             if self.right() > LOOKRIGHT:
                 self.change_state(State.TURN_RIGHT)
             elif self.front() < LOOKAHEAD:
                 self.change_state(State.TURN_LEFT)
+        # If turning left, move forward once there is no longer a wall in front.
         elif self.state == State.TURN_LEFT:
             if not self.front() < LOOKAHEAD:
                 self.change_state(State.FORWARD)
         #elif self.state == State.TURN_RIGHT:
         #    if not self.right() > LOOKRIGHT:
         #        self.change_state(State.FORWARD)
+        
+        # If locked forward, right turns are forbidden, only left turns allowed.
         elif self.state == State.LOCKED_FORWARD:
             if self.front() < LOOKAHEAD:
                 self.change_state(State.TURN_LEFT)
+        
+        # If moving towards a point, and close enought to target point, exit and return to either forward or turn left depending on surroundings
         elif self.state == State.MOVE_TO:
             if self.x is None:
                 return
@@ -710,30 +802,39 @@ class AutoNav(Node):
                     self.change_state(State.FORWARD)
                 if self.front() < LOOKAHEAD:
                     self.change_state(State.TURN_LEFT)
+        
+        # If aiming and the correct angle is achieved, start firing
         elif self.state == State.AIM:
             if self.x is None:
                 return
             _, achieved = turn_towards(self.yaw, np.rad2deg(angle_to(self.x, self.y, self.state_data["head_x"], self.state_data["head_y"])), True)
             if achieved:
                 self.change_state(State.FIRING)
+                
+        # If the maze walls are disconnected, we need to occasionally make a random left turn to attempt to explore the full maze
         if RANDOMIZE and self.toured and self.seen_nfc:
             if random.randint(0, 50)  == 0:
                 self.change_state(State.SEEK, target_angle=90.0)
 
+    # Multiple different situations to update state when new location data is recieved
     def update_state_odom(self):
         if self.x is None:
             self.stopbot()
             return
+        # If turning towards a wall and the correct angle is achieved, start moving forward
         if self.state == State.SEEK:
             _, achieved = turn_towards(self.yaw, self.state_data["target_angle"], self.state_data["precise"])
             if achieved:
                 self.change_state(State.LOCKED_FORWARD)
+        # If turning right and 90 degrees has passed, start moving forward
         elif self.state == State.TURN_RIGHT:
             if min((self.yaw - self.state_data["start_angle"] + 360) % 360, 360 - (self.yaw - self.state_data["start_angle"] + 360) % 360) >= 90:
                 self.change_state(State.LOCKED_FORWARD, dist=ROBOT_LEN)
+        # If locked forward and the required distance has passed, change to just moving forward
         elif self.state == State.LOCKED_FORWARD:
             if self.state_data["dist"] is not None and dist_to(*self.state_data["start"], self.x, self.y) >= self.state_data["dist"]:
                 self.change_state(State.FORWARD)
+        # If moving towards a target and the correct angle is achieved, stop and scan the target for more precise readings
         elif self.state == State.MOVE_TARGET:
             _, achieved = turn_towards(self.yaw, np.rad2deg(angle_to(self.x, self.y, self.state_data["head_x"], self.state_data["head_y"])), True)
             if achieved:
@@ -747,6 +848,8 @@ class AutoNav(Node):
             
 
     def update_state_thermal(self):
+        # If currently trying to scan the target, take readings until either we see that the target is actually not present, or we reach a threshold
+        # Then, turn towards the average of the points.
         if self.state == State.GATHER_TARGET:
             self.state_data["collected_points"] += self.thermal_surroundings
             if len(self.state_data["collected_points"]) >= FOUND_THRESHOLD:
@@ -788,6 +891,7 @@ class AutoNav(Node):
 
             print("Found heat at:", ax, ay)
 
+            # If we see heat and are loaded, move towards the target
             if len(self.thermal_surroundings) >= 5 and self.loaded != 0 and not self.is_target_state():
                 if self.toured:
                     if self.x is None:
@@ -800,7 +904,7 @@ class AutoNav(Node):
                 else:
                     print("Found target, but waiting for tour completion first")
 
-            
+    # How each state translates into actions of the robot        
     def execute_state(self):
         if self.x is None:
             self.stopbot()
